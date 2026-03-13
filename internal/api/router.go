@@ -43,6 +43,7 @@ func NewRouterWithDeps(
 	mux := http.NewServeMux()
 	h := NewHandler(storeImpl, paddleVerifier, mem0Client, compatTokenManager)
 	admin := NewAdminHandler(storeImpl, cfg.AdminMasterPassword, cfg.AdminSessionSecret, cfg.AdminSessionTTL)
+	user := NewUserHandler(storeImpl, cfg.UserDashboardPassword, cfg.UserSessionSecret, cfg.UserSessionTTL)
 	authMiddleware := func(next http.HandlerFunc) http.Handler {
 		return middleware.CompatibilityBearerAuth(supabaseVerifier, compatTokenManager, next)
 	}
@@ -58,6 +59,13 @@ func NewRouterWithDeps(
 	mux.HandleFunc("GET /admin/wireguard-qr/{account}/{device}", admin.DownloadWireGuardQRCode)
 	mux.HandleFunc("POST /admin/wireguard-key/{account}/{device}/generate", admin.GenerateAndSyncWireGuardKey)
 	mux.HandleFunc("POST /admin/logout", admin.Logout)
+	mux.HandleFunc("GET /user/login", user.LoginPage)
+	mux.Handle("POST /user/login", middleware.RateLimit(authRateLimiter, "user-login", http.HandlerFunc(user.LoginSubmit)))
+	mux.HandleFunc("GET /user", user.Dashboard)
+	mux.HandleFunc("POST /user/logout", user.Logout)
+	mux.HandleFunc("POST /user/devices/create", user.CreateDeviceAndDownloadConfig)
+	mux.HandleFunc("POST /user/devices/{id}/delete", user.DeleteDevice)
+	mux.HandleFunc("POST /user/devices/{id}/config", user.RotateDeviceAndDownloadConfig)
 
 	// Public compatibility API
 	mux.Handle("POST /auth/v1/token", middleware.RateLimit(authRateLimiter, "auth-token", http.HandlerFunc(h.CreateAccessToken)))

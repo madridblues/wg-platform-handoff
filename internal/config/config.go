@@ -22,6 +22,9 @@ type Config struct {
 	AdminMasterPassword       string
 	AdminSessionSecret        string
 	AdminSessionTTL           time.Duration
+	UserDashboardPassword     string
+	UserSessionSecret         string
+	UserSessionTTL            time.Duration
 	ControlPlaneBaseURL       string
 	GatewayID                 string
 	GatewayRegion             string
@@ -57,6 +60,9 @@ func Load() Config {
 		AdminMasterPassword:       os.Getenv("ADMIN_MASTER_PASSWORD"),
 		AdminSessionSecret:        firstNonEmpty(strings.TrimSpace(os.Getenv("ADMIN_SESSION_SECRET")), strings.TrimSpace(os.Getenv("COMPAT_TOKEN_SECRET")), strings.TrimSpace(os.Getenv("SUPABASE_JWT_SECRET"))),
 		AdminSessionTTL:           time.Duration(getEnvInt("ADMIN_SESSION_TTL_SECONDS", 43200)) * time.Second,
+		UserDashboardPassword:     os.Getenv("USER_DASHBOARD_PASSWORD"),
+		UserSessionSecret:         firstNonEmpty(strings.TrimSpace(os.Getenv("USER_SESSION_SECRET")), strings.TrimSpace(os.Getenv("ADMIN_SESSION_SECRET")), strings.TrimSpace(os.Getenv("COMPAT_TOKEN_SECRET")), strings.TrimSpace(os.Getenv("SUPABASE_JWT_SECRET"))),
+		UserSessionTTL:            time.Duration(getEnvInt("USER_SESSION_TTL_SECONDS", 43200)) * time.Second,
 		ControlPlaneBaseURL:       getEnv("CONTROL_PLANE_BASE_URL", "http://localhost:8080"),
 		GatewayID:                 getEnv("GATEWAY_ID", "gateway-dev"),
 		GatewayRegion:             getEnv("GATEWAY_REGION", "dev-region"),
