@@ -1135,19 +1135,16 @@ func (s *Store) updateDeviceRuntimeStatsFromMetrics(ctx context.Context, relayID
 		return nil
 	}
 
-	rawPeers, ok := metrics["peers"]
-	if !ok {
-		return nil
-	}
-
-	peerItems, ok := rawPeers.([]any)
-	if !ok {
+	peerItems := extractPeerMetrics(metrics["peers"])
+	if len(peerItems) == 0 {
 		return nil
 	}
 
 	const upsertQuery = `
 insert into device_runtime_stats (device_id, relay_id, endpoint, last_handshake_at, rx_bytes, tx_bytes, updated_at)
-values ($1::uuid, $2::uuid, nullif($3, ''), $4, $5, $6, now())
+select id, $2::uuid, nullif($3, ''), $4, $5, $6, now()
+from devices
+where pubkey = $1
 on conflict (device_id) do update
 set
     relay_id = excluded.relay_id,
@@ -1159,35 +1156,63 @@ set
 `
 
 	for _, item := range peerItems {
-		peerMap, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		publicKey := strings.TrimSpace(toMetricString(peerMap["public_key"]))
+		publicKey := strings.TrimSpace(item.PublicKey)
 		if publicKey == "" {
 			continue
 		}
 
-		var deviceID string
-		if err := s.db.QueryRowContext(ctx, `select id::text from devices where pubkey = $1`, publicKey).Scan(&deviceID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			return fmt.Errorf("lookup device by public key: %w", err)
-		}
+		endpoint := strings.TrimSpace(item.Endpoint)
+		lastHandshake := toMetricTime(item.LatestHandshake)
+		rxBytes := toMetricInt64(item.RXBytes)
+		txBytes := toMetricInt64(item.TXBytes)
 
-		endpoint := strings.TrimSpace(toMetricString(peerMap["endpoint"]))
-		lastHandshake := toMetricTime(peerMap["latest_handshake"])
-		rxBytes := toMetricInt64(peerMap["rx_bytes"])
-		txBytes := toMetricInt64(peerMap["tx_bytes"])
-
-		if _, err := s.db.ExecContext(ctx, upsertQuery, deviceID, relayID, endpoint, lastHandshake, rxBytes, txBytes); err != nil {
+		if _, err := s.db.ExecContext(ctx, upsertQuery, publicKey, relayID, endpoint, lastHandshake, rxBytes, txBytes); err != nil {
 			return fmt.Errorf("upsert device runtime stats: %w", err)
 		}
 	}
 
 	return nil
+}
+
+type peerMetric struct {
+	PublicKey       string
+	Endpoint        string
+	LatestHandshake any
+	RXBytes         any
+	TXBytes         any
+}
+
+func extractPeerMetrics(value any) []peerMetric {
+	switch typed := value.(type) {
+	case []any:
+		out := make([]peerMetric, 0, len(typed))
+		for _, item := range typed {
+			if peerMap, ok := item.(map[string]any); ok {
+				out = append(out, peerMetric{
+					PublicKey:       toMetricString(peerMap["public_key"]),
+					Endpoint:        toMetricString(peerMap["endpoint"]),
+					LatestHandshake: peerMap["latest_handshake"],
+					RXBytes:         peerMap["rx_bytes"],
+					TXBytes:         peerMap["tx_bytes"],
+				})
+			}
+		}
+		return out
+	case []map[string]any:
+		out := make([]peerMetric, 0, len(typed))
+		for _, peerMap := range typed {
+			out = append(out, peerMetric{
+				PublicKey:       toMetricString(peerMap["public_key"]),
+				Endpoint:        toMetricString(peerMap["endpoint"]),
+				LatestHandshake: peerMap["latest_handshake"],
+				RXBytes:         peerMap["rx_bytes"],
+				TXBytes:         peerMap["tx_bytes"],
+			})
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func (s *Store) resolveAccountIDForBilling(ctx context.Context, tx *sql.Tx, provider string, event domain.BillingEvent) (string, error) {
