@@ -43,7 +43,14 @@ func NewRouterWithDeps(
 	mux := http.NewServeMux()
 	h := NewHandler(storeImpl, paddleVerifier, mem0Client, compatTokenManager)
 	admin := NewAdminHandler(storeImpl, cfg.AdminMasterPassword, cfg.AdminSessionSecret, cfg.AdminSessionTTL)
-	user := NewUserHandler(storeImpl, cfg.UserDashboardPassword, cfg.UserSessionSecret, cfg.UserSessionTTL)
+	user := NewUserHandler(
+		storeImpl,
+		cfg.UserDashboardPassword,
+		cfg.UserSessionSecret,
+		cfg.UserSessionTTL,
+		cfg.SupabaseURL,
+		cfg.SupabaseAnonKey,
+	)
 	authMiddleware := func(next http.HandlerFunc) http.Handler {
 		return middleware.CompatibilityBearerAuth(supabaseVerifier, compatTokenManager, next)
 	}
@@ -61,6 +68,7 @@ func NewRouterWithDeps(
 	mux.HandleFunc("POST /admin/logout", admin.Logout)
 	mux.HandleFunc("GET /user/login", user.LoginPage)
 	mux.Handle("POST /user/login", middleware.RateLimit(authRateLimiter, "user-login", http.HandlerFunc(user.LoginSubmit)))
+	mux.Handle("POST /user/login-email", middleware.RateLimit(authRateLimiter, "user-login-email", http.HandlerFunc(user.LoginEmailSubmit)))
 	mux.HandleFunc("GET /user", user.Dashboard)
 	mux.HandleFunc("POST /user/logout", user.Logout)
 	mux.HandleFunc("POST /user/devices/create", user.CreateDeviceAndDownloadConfig)

@@ -1,12 +1,15 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -22,6 +25,9 @@ type UserHandler struct {
 	store             store.Store
 	dashboardPassword string
 	session           *userSessionManager
+	supabaseURL       string
+	supabaseAnonKey   string
+	httpClient        *http.Client
 }
 
 type userSessionManager struct {
@@ -34,7 +40,9 @@ type userDashboardView struct {
 	AccountStatus string
 	Expiry        string
 	GeneratedAt   string
+	CanEmailLogin bool
 	Devices       []userDeviceRow
+	RecentSessions []userSessionRow
 }
 
 type userDeviceRow struct {
@@ -42,6 +50,17 @@ type userDeviceRow struct {
 	Name      string
 	IPv4      string
 	CreatedAt string
+	Connected string
+	Usage     string
+	UsagePct  int
+}
+
+type userSessionRow struct {
+	DeviceID    string
+	Relay       string
+	Endpoint    string
+	HandshakeAt string
+	TrafficAt   string
 }
 
 var userLoginTemplate = template.Must(template.New("user-login").Parse(`<!doctype html>
@@ -69,6 +88,16 @@ var userLoginTemplate = template.Must(template.New("user-login").Parse(`<!doctyp
       <input id="password" name="password" type="password" autocomplete="current-password" />
       <button type="submit">Sign In</button>
     </form>
+    {{if .CanEmailLogin}}
+    <hr/>
+    <form method="post" action="/user/login-email">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email" required />
+      <label for="epassword">Password</label>
+      <input id="epassword" name="password" type="password" autocomplete="current-password" required />
+      <button type="submit">Sign In with Email</button>
+    </form>
+    {{end}}
   </div>
 </body>
 </html>`))
@@ -118,13 +147,15 @@ var userDashboardTemplate = template.Must(template.New("user-dashboard").Parse(`
   <table>
     <thead>
       <tr>
-        <th>ID</th><th>Name</th><th>IPv4</th><th>Created</th><th>Actions</th>
+        <th>ID</th><th>Name</th><th>IPv4</th><th>Status</th><th>Usage</th><th>Created</th><th>Actions</th>
       </tr>
     </thead>
     <tbody>
       {{range .Devices}}
       <tr>
-        <td>{{.ID}}</td><td>{{.Name}}</td><td>{{.IPv4}}</td><td>{{.CreatedAt}}</td>
+        <td>{{.ID}}</td><td>{{.Name}}</td><td>{{.IPv4}}</td><td>{{.Connected}}</td>
+        <td>{{.Usage}}<div class="bar"><span style="width: {{.UsagePct}}%;"></span></div></td>
+        <td>{{.CreatedAt}}</td>
         <td>
           <form method="post" action="/user/devices/{{.ID}}/config" style="display:inline;">
             <input type="hidden" name="mode" value="full"/>
@@ -138,14 +169,36 @@ var userDashboardTemplate = template.Must(template.New("user-dashboard").Parse(`
       {{end}}
     </tbody>
   </table>
+  <h2>Recent Connection History</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>When</th><th>Device</th><th>Gateway</th><th>Endpoint</th><th>Traffic Snapshot</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .RecentSessions}}
+      <tr>
+        <td>{{.HandshakeAt}}</td><td>{{.DeviceID}}</td><td>{{.Relay}}</td><td>{{.Endpoint}}</td><td>{{.TrafficAt}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
 </body>
 </html>`))
 
-func NewUserHandler(storeImpl store.Store, dashboardPassword, sessionSecret string, sessionTTL time.Duration) *UserHandler {
+type userSessionReadable interface {
+	AdminListSessionEventsByAccount(ctx context.Context, accountNumber string, limit int) ([]domain.DeviceSessionEvent, error)
+}
+
+func NewUserHandler(storeImpl store.Store, dashboardPassword, sessionSecret string, sessionTTL time.Duration, supabaseURL, supabaseAnonKey string) *UserHandler {
 	return &UserHandler{
 		store:             storeImpl,
 		dashboardPassword: strings.TrimSpace(dashboardPassword),
 		session:           newUserSessionManager(sessionSecret, sessionTTL),
+		supabaseURL:       strings.TrimSpace(supabaseURL),
+		supabaseAnonKey:   strings.TrimSpace(supabaseAnonKey),
+		httpClient:        &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -196,6 +249,50 @@ func (h *UserHandler) LoginSubmit(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/user", http.StatusSeeOther)
 }
 
+func (h *UserHandler) LoginEmailSubmit(w http.ResponseWriter, r *http.Request) {
+	if !h.enabled() {
+		http.Error(w, "user dashboard disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if !h.emailLoginEnabled() {
+		h.renderLogin(w, "Email login is not configured")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		h.renderLogin(w, "Invalid form")
+		return
+	}
+	email := strings.TrimSpace(r.FormValue("email"))
+	password := strings.TrimSpace(r.FormValue("password"))
+	if email == "" || password == "" {
+		h.renderLogin(w, "Email and password are required")
+		return
+	}
+
+	userID, err := h.verifySupabasePasswordLogin(r.Context(), email, password)
+	if err != nil {
+		h.renderLogin(w, "Invalid email or password")
+		return
+	}
+	account, err := h.store.GetOrCreateAccountByUserID(r.Context(), userID)
+	if err != nil {
+		h.renderLogin(w, "Failed to resolve account")
+		return
+	}
+
+	token, expiresAt := h.session.Issue(account.Number)
+	http.SetCookie(w, &http.Cookie{
+		Name:     userSessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsHTTPS(r),
+		Expires:  expiresAt,
+	})
+	http.Redirect(w, r, "/user", http.StatusSeeOther)
+}
+
 func (h *UserHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     userSessionCookieName,
@@ -227,14 +324,70 @@ func (h *UserHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	backend, _ := h.store.(adminReadableStore)
+	runtimeByID := map[string]domain.AdminDeviceSummary{}
+	if backend != nil {
+		if runtimeDevices, err := backend.AdminListDevices(r.Context(), 2000); err == nil {
+			for _, item := range runtimeDevices {
+				if strings.EqualFold(strings.TrimSpace(item.AccountNumber), account.Number) {
+					runtimeByID[item.ID] = item
+				}
+			}
+		}
+	}
+
 	rows := make([]userDeviceRow, 0, len(devices))
+	var maxUsage int64
 	for _, d := range devices {
+		runtime := runtimeByID[d.ID]
+		usage := runtime.RxBytes + runtime.TxBytes
+		if usage > maxUsage {
+			maxUsage = usage
+		}
+	}
+	for _, d := range devices {
+		runtime := runtimeByID[d.ID]
+		usage := runtime.RxBytes + runtime.TxBytes
+		usagePct := 0
+		if maxUsage > 0 {
+			usagePct = int((float64(usage) / float64(maxUsage)) * 100)
+		}
+		status := "offline"
+		if runtime.Connected {
+			status = "connected"
+		}
 		rows = append(rows, userDeviceRow{
 			ID:        d.ID,
 			Name:      d.Name,
 			IPv4:      d.IPv4Address,
 			CreatedAt: formatTS(d.Created),
+			Connected: status,
+			Usage:     formatBytes(usage),
+			UsagePct:  usagePct,
 		})
+	}
+
+	sessions := make([]userSessionRow, 0)
+	if sessionReader, ok := h.store.(userSessionReadable); ok {
+		if events, err := sessionReader.AdminListSessionEventsByAccount(r.Context(), account.Number, 50); err == nil {
+			for _, e := range events {
+				relay := strings.TrimSpace(e.RelayHostname)
+				if relay == "" {
+					relay = "n/a"
+				}
+				endpoint := strings.TrimSpace(e.Endpoint)
+				if endpoint == "" {
+					endpoint = "n/a"
+				}
+				sessions = append(sessions, userSessionRow{
+					DeviceID:    e.DeviceID,
+					Relay:       relay,
+					Endpoint:    endpoint,
+					HandshakeAt: formatTS(e.HandshakeAt),
+					TrafficAt:   fmt.Sprintf("RX %s / TX %s", formatBytes(e.RXBytesSnapshot), formatBytes(e.TXBytesSnapshot)),
+				})
+			}
+		}
 	}
 
 	view := userDashboardView{
@@ -242,7 +395,9 @@ func (h *UserHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		AccountStatus: account.Status,
 		Expiry:        formatTS(account.Expiry),
 		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+		CanEmailLogin: h.emailLoginEnabled(),
 		Devices:       rows,
+		RecentSessions: sessions,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = userDashboardTemplate.Execute(w, view)
@@ -430,11 +585,18 @@ PersistentKeepalive = 25
 
 func (h *UserHandler) renderLogin(w http.ResponseWriter, errorText string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = userLoginTemplate.Execute(w, map[string]string{"Error": errorText})
+	_ = userLoginTemplate.Execute(w, map[string]any{
+		"Error":         errorText,
+		"CanEmailLogin": h.emailLoginEnabled(),
+	})
 }
 
 func (h *UserHandler) enabled() bool {
 	return h != nil && h.session != nil && len(h.session.secret) > 0
+}
+
+func (h *UserHandler) emailLoginEnabled() bool {
+	return h != nil && strings.TrimSpace(h.supabaseURL) != "" && strings.TrimSpace(h.supabaseAnonKey) != ""
 }
 
 func (h *UserHandler) authenticatedAccount(r *http.Request) (string, bool) {
@@ -504,3 +666,44 @@ func (m *userSessionManager) sign(payload string) string {
 	_, _ = mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))
 }
+
+func (h *UserHandler) verifySupabasePasswordLogin(ctx context.Context, email, password string) (string, error) {
+	body := map[string]string{
+		"email":    strings.TrimSpace(email),
+		"password": password,
+	}
+	b, _ := json.Marshal(body)
+	url := strings.TrimRight(h.supabaseURL, "/") + "/auth/v1/token?grant_type=password"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("apikey", h.supabaseAnonKey)
+	req.Header.Set("Authorization", "Bearer "+h.supabaseAnonKey)
+
+	res, err := h.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 300 {
+		payload, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
+		return "", fmt.Errorf("supabase auth failed: %s", strings.TrimSpace(string(payload)))
+	}
+
+	var payload struct {
+		User struct {
+			ID string `json:"id"`
+		} `json:"user"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.User.ID) == "" {
+		return "", fmt.Errorf("supabase user id missing")
+	}
+	return strings.TrimSpace(payload.User.ID), nil
+}
+    .bar { width: 100%; height: 8px; border-radius: 999px; background: #eee; margin-top: 4px; }
+    .bar > span { display: block; height: 100%; border-radius: 999px; background: #1565c0; }

@@ -55,3 +55,14 @@ type AdminDeviceSummary struct {
 	TxBytes       int64
 	Connected     bool
 }
+
+type DeviceSessionEvent struct {
+	DeviceID         string
+	AccountNumber    string
+	RelayHostname    string
+	Endpoint         string
+	HandshakeAt      time.Time
+	RXBytesSnapshot  int64
+	TXBytesSnapshot  int64
+	RecordedAt       time.Time
+}

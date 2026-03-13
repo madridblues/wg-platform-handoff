@@ -488,10 +488,54 @@ values ($1::uuid, $2, $3::jsonb)
 		return fmt.Errorf("insert relay heartbeat: %w", err)
 	}
 
+	if err := s.insertDeviceSessionEventsFromJSON(ctx, relayID, string(metrics)); err != nil {
+		return fmt.Errorf("insert device session events: %w", err)
+	}
+
 	if err := s.updateDeviceRuntimeStatsFromJSON(ctx, relayID, string(metrics)); err != nil {
 		return fmt.Errorf("update device runtime stats: %w", err)
 	}
 
+	return nil
+}
+
+func (s *Store) insertDeviceSessionEventsFromJSON(ctx context.Context, relayID, metricsJSON string) error {
+	if strings.TrimSpace(metricsJSON) == "" {
+		return nil
+	}
+
+	const query = `
+with peer_data as (
+    select
+        nullif(peer ->> 'public_key', '') as public_key,
+        nullif(peer ->> 'endpoint', '') as endpoint,
+        coalesce(nullif(peer ->> 'latest_handshake', '')::bigint, 0) as latest_handshake,
+        coalesce(nullif(peer ->> 'rx_bytes', '')::bigint, 0) as rx_bytes,
+        coalesce(nullif(peer ->> 'tx_bytes', '')::bigint, 0) as tx_bytes
+    from jsonb_array_elements(coalesce(($2::jsonb)->'peers', '[]'::jsonb)) peer
+)
+insert into device_session_events (device_id, relay_id, endpoint, handshake_at, rx_bytes_snapshot, tx_bytes_snapshot)
+select
+    d.id,
+    $1::uuid,
+    p.endpoint,
+    to_timestamp(p.latest_handshake),
+    p.rx_bytes,
+    p.tx_bytes
+from peer_data p
+join devices d on d.pubkey = p.public_key
+left join device_runtime_stats drs on drs.device_id = d.id
+where p.latest_handshake > 0
+  and (
+      drs.last_handshake_at is null
+      or extract(epoch from drs.last_handshake_at)::bigint <> p.latest_handshake
+  )
+on conflict (device_id, handshake_at) do nothing;
+`
+
+	if _, err := s.db.ExecContext(ctx, query, relayID, metricsJSON); err != nil {
+		return fmt.Errorf("insert session events from metrics json: %w", err)
+	}
 	return nil
 }
 
@@ -1143,6 +1187,64 @@ left join relays r on r.id = drs.relay_id;
 	}
 
 	return item, nil
+}
+
+func (s *Store) AdminListSessionEventsByAccount(ctx context.Context, accountNumber string, limit int) ([]domain.DeviceSessionEvent, error) {
+	accountNumber = strings.TrimSpace(accountNumber)
+	if accountNumber == "" {
+		return nil, errors.New("account number is required")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	const query = `
+select
+    e.device_id::text,
+    a.account_number,
+    coalesce(r.hostname, ''),
+    coalesce(e.endpoint, ''),
+    e.handshake_at,
+    e.rx_bytes_snapshot,
+    e.tx_bytes_snapshot,
+    e.created_at
+from device_session_events e
+join devices d on d.id = e.device_id
+join accounts a on a.id = d.account_id
+left join relays r on r.id = e.relay_id
+where a.account_number = $1
+order by e.created_at desc
+limit $2;
+`
+
+	rows, err := s.db.QueryContext(ctx, query, accountNumber, limit)
+	if err != nil {
+		return nil, fmt.Errorf("admin list session events: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]domain.DeviceSessionEvent, 0)
+	for rows.Next() {
+		var item domain.DeviceSessionEvent
+		if err := rows.Scan(
+			&item.DeviceID,
+			&item.AccountNumber,
+			&item.RelayHostname,
+			&item.Endpoint,
+			&item.HandshakeAt,
+			&item.RXBytesSnapshot,
+			&item.TXBytesSnapshot,
+			&item.RecordedAt,
+		); err != nil {
+			return nil, fmt.Errorf("admin scan session event: %w", err)
+		}
+		out = append(out, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("admin iterate session events: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Store) updateDeviceRuntimeStatsFromJSON(ctx context.Context, relayID string, metricsJSON string) error {

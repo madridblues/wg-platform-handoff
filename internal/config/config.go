@@ -15,6 +15,8 @@ type Config struct {
 	WebhookRateLimitPerMinute int
 	DatabaseURL               string
 	SupabaseJWTSecret         string
+	SupabaseURL               string
+	SupabaseAnonKey           string
 	CompatTokenSecret         string
 	CompatTokenTTL            time.Duration
 	PaddleWebhookSecret       string
@@ -53,6 +55,8 @@ func Load() Config {
 		WebhookRateLimitPerMinute: getEnvInt("WEBHOOK_RATE_LIMIT_PER_MINUTE", 600),
 		DatabaseURL:               os.Getenv("DATABASE_URL"),
 		SupabaseJWTSecret:         os.Getenv("SUPABASE_JWT_SECRET"),
+		SupabaseURL:               strings.TrimSpace(os.Getenv("SUPABASE_URL")),
+		SupabaseAnonKey:           strings.TrimSpace(os.Getenv("SUPABASE_ANON_KEY")),
 		CompatTokenSecret:         firstNonEmpty(strings.TrimSpace(os.Getenv("COMPAT_TOKEN_SECRET")), strings.TrimSpace(os.Getenv("SUPABASE_JWT_SECRET"))),
 		CompatTokenTTL:            time.Duration(getEnvInt("COMPAT_TOKEN_TTL_SECONDS", 3600)) * time.Second,
 		PaddleWebhookSecret:       os.Getenv("PADDLE_WEBHOOK_SECRET"),
