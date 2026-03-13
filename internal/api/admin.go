@@ -370,7 +370,7 @@ func (h *AdminHandler) DownloadWireGuardConfig(w http.ResponseWriter, r *http.Re
 	device, conf, err := h.buildWireGuardConfig(r.Context(), backend, r.PathValue("account"), r.PathValue("device"), r.URL.Query().Get("private_key"))
 	if err != nil {
 		status := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "missing or invalid private_key") || strings.Contains(err.Error(), "missing account/device") {
+		if strings.Contains(err.Error(), "private_key") || strings.Contains(err.Error(), "missing account/device") {
 			status = http.StatusBadRequest
 		}
 		if strings.Contains(err.Error(), "device not found") {
@@ -409,7 +409,7 @@ func (h *AdminHandler) DownloadWireGuardQRCode(w http.ResponseWriter, r *http.Re
 	_, conf, err := h.buildWireGuardConfig(r.Context(), backend, r.PathValue("account"), r.PathValue("device"), r.URL.Query().Get("private_key"))
 	if err != nil {
 		status := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "missing or invalid private_key") || strings.Contains(err.Error(), "missing account/device") {
+		if strings.Contains(err.Error(), "private_key") || strings.Contains(err.Error(), "missing account/device") {
 			status = http.StatusBadRequest
 		}
 		if strings.Contains(err.Error(), "device not found") {
