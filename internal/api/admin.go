@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skip2/go-qrcode"
 	"wg-platform-handoff/internal/domain"
 	"wg-platform-handoff/internal/store"
 )
@@ -41,10 +42,14 @@ type adminSessionManager struct {
 }
 
 type adminDashboardView struct {
-	GeneratedAt string
-	Accounts    []adminAccountRow
-	Gateways    []adminGatewayRow
-	Devices     []adminDeviceRow
+	GeneratedAt      string
+	TotalAccounts    int
+	TotalDevices     int
+	TotalGateways    int
+	HealthyGateways  int
+	Accounts         []adminAccountRow
+	Gateways         []adminGatewayRow
+	Devices          []adminDeviceRow
 }
 
 type adminAccountRow struct {
@@ -74,6 +79,7 @@ type adminDeviceRow struct {
 	IPv4Address   string
 	CreatedAt     string
 	DownloadURL   string
+	QRURL         string
 }
 
 var adminLoginTemplate = template.Must(template.New("admin-login").Parse(`<!doctype html>
@@ -118,7 +124,14 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
     .muted { color: #666; font-size: 12px; margin-bottom: 1rem; }
     .section { margin-top: 1rem; }
     button { padding: 0.45rem 0.8rem; }
+    .cards { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 0.75rem; margin: 0.8rem 0 1.4rem 0; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 0.7rem; background: #fafafa; }
+    .label { font-size: 12px; color: #666; }
+    .value { font-size: 22px; font-weight: 700; margin-top: 0.2rem; }
+    .wg-form { display: flex; gap: 0.35rem; align-items: center; flex-wrap: wrap; }
+    .wg-form input { min-width: 220px; padding: 0.35rem; }
   </style>
+  <meta http-equiv="refresh" content="20"/>
 </head>
 <body>
   <header>
@@ -126,6 +139,12 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
     <form method="post" action="/admin/logout"><button type="submit">Logout</button></form>
   </header>
   <div class="muted">Generated: {{.GeneratedAt}}</div>
+  <div class="cards">
+    <div class="card"><div class="label">Accounts</div><div class="value">{{.TotalAccounts}}</div></div>
+    <div class="card"><div class="label">Devices</div><div class="value">{{.TotalDevices}}</div></div>
+    <div class="card"><div class="label">Gateways</div><div class="value">{{.TotalGateways}}</div></div>
+    <div class="card"><div class="label">Healthy Gateways</div><div class="value">{{.HealthyGateways}}</div></div>
+  </div>
 
   <div class="section">
     <h2>Gateways</h2>
@@ -179,9 +198,10 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
         <tr>
           <td>{{.AccountNumber}}</td><td>{{.DeviceID}}</td><td>{{.DeviceName}}</td><td>{{.IPv4Address}}</td><td>{{.CreatedAt}}</td>
           <td>
-            <form method="get" action="{{.DownloadURL}}">
+            <form class="wg-form" method="get" action="{{.DownloadURL}}">
               <input type="text" name="private_key" placeholder="Client private key (base64)" required />
               <button type="submit">Download</button>
+              <button type="submit" formaction="{{.QRURL}}" formtarget="_blank">QR</button>
             </form>
           </td>
         </tr>
@@ -288,10 +308,14 @@ func (h *AdminHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := adminDashboardView{
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		Accounts:    toAdminAccountRows(accounts),
-		Gateways:    toAdminGatewayRows(gateways),
-		Devices:     toAdminDeviceRows(devices),
+		GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
+		TotalAccounts:   len(accounts),
+		TotalDevices:    len(devices),
+		TotalGateways:   len(gateways),
+		HealthyGateways: countHealthyGateways(gateways),
+		Accounts:        toAdminAccountRows(accounts),
+		Gateways:        toAdminGatewayRows(gateways),
+		Devices:         toAdminDeviceRows(devices),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -315,28 +339,91 @@ func (h *AdminHandler) DownloadWireGuardConfig(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	accountNumber := strings.TrimSpace(r.PathValue("account"))
-	deviceID := strings.TrimSpace(r.PathValue("device"))
-	privateKey := strings.TrimSpace(r.URL.Query().Get("private_key"))
-	if accountNumber == "" || deviceID == "" {
-		http.Error(w, "missing account/device path params", http.StatusBadRequest)
+	device, conf, err := h.buildWireGuardConfig(r.Context(), backend, r.PathValue("account"), r.PathValue("device"), r.URL.Query().Get("private_key"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "missing or invalid private_key") || strings.Contains(err.Error(), "missing account/device") {
+			status = http.StatusBadRequest
+		}
+		if strings.Contains(err.Error(), "device not found") {
+			status = http.StatusNotFound
+		}
+		if strings.Contains(err.Error(), "no active gateway") {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(w, err.Error(), status)
 		return
+	}
+
+	filename := fmt.Sprintf("%s-%s.conf", sanitizeFilename(device.AccountNumber), sanitizeFilename(device.ID))
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	_, _ = w.Write([]byte(conf))
+}
+
+func (h *AdminHandler) DownloadWireGuardQRCode(w http.ResponseWriter, r *http.Request) {
+	if !h.enabled() {
+		http.Error(w, "admin dashboard disabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	if !h.isAuthenticated(r) {
+		http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
+		return
+	}
+
+	backend, ok := h.store.(adminReadableStore)
+	if !ok {
+		http.Error(w, "admin backend unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	_, conf, err := h.buildWireGuardConfig(r.Context(), backend, r.PathValue("account"), r.PathValue("device"), r.URL.Query().Get("private_key"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "missing or invalid private_key") || strings.Contains(err.Error(), "missing account/device") {
+			status = http.StatusBadRequest
+		}
+		if strings.Contains(err.Error(), "device not found") {
+			status = http.StatusNotFound
+		}
+		if strings.Contains(err.Error(), "no active gateway") {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	png, err := qrcode.Encode(conf, qrcode.Medium, 320)
+	if err != nil {
+		http.Error(w, "failed to render qr code", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(png)
+}
+
+func (h *AdminHandler) buildWireGuardConfig(ctx context.Context, backend adminReadableStore, accountPathValue, devicePathValue, privateKeyRaw string) (domain.AdminDeviceSummary, string, error) {
+	accountNumber := strings.TrimSpace(accountPathValue)
+	deviceID := strings.TrimSpace(devicePathValue)
+	privateKey := strings.TrimSpace(privateKeyRaw)
+	if accountNumber == "" || deviceID == "" {
+		return domain.AdminDeviceSummary{}, "", fmt.Errorf("missing account/device path params")
 	}
 	if !looksLikeWireGuardPrivateKey(privateKey) {
-		http.Error(w, "missing or invalid private_key query parameter", http.StatusBadRequest)
-		return
+		return domain.AdminDeviceSummary{}, "", fmt.Errorf("missing or invalid private_key query parameter")
 	}
 
-	device, err := backend.AdminGetDeviceByAccountNumber(r.Context(), accountNumber, deviceID)
+	device, err := backend.AdminGetDeviceByAccountNumber(ctx, accountNumber, deviceID)
 	if err != nil {
-		http.Error(w, "device not found", http.StatusNotFound)
-		return
+		return domain.AdminDeviceSummary{}, "", fmt.Errorf("device not found")
 	}
 
-	gateways, err := backend.AdminListGateways(r.Context(), 200)
+	gateways, err := backend.AdminListGateways(ctx, 200)
 	if err != nil {
-		http.Error(w, "failed to load gateways", http.StatusInternalServerError)
-		return
+		return domain.AdminDeviceSummary{}, "", fmt.Errorf("failed to load gateways")
 	}
 
 	var selected *domain.AdminGatewaySummary
@@ -348,8 +435,7 @@ func (h *AdminHandler) DownloadWireGuardConfig(w http.ResponseWriter, r *http.Re
 		}
 	}
 	if selected == nil {
-		http.Error(w, "no active gateway with wireguard key", http.StatusServiceUnavailable)
-		return
+		return domain.AdminDeviceSummary{}, "", fmt.Errorf("no active gateway with wireguard key")
 	}
 
 	endpointIP := stripNetworkMask(strings.TrimSpace(selected.PublicIPv4))
@@ -365,10 +451,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 `, privateKey, device.IPv4Address, device.IPv6Address, selected.WGPublicKey, endpointIP)
 
-	filename := fmt.Sprintf("%s-%s.conf", sanitizeFilename(device.AccountNumber), sanitizeFilename(device.ID))
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
-	_, _ = w.Write([]byte(conf))
+	return device, conf, nil
 }
 
 func (h *AdminHandler) renderLogin(w http.ResponseWriter, errorText string) {
@@ -540,9 +623,24 @@ func toAdminDeviceRows(items []domain.AdminDeviceSummary) []adminDeviceRow {
 			IPv4Address:   item.IPv4Address,
 			CreatedAt:     formatTS(item.CreatedAt),
 			DownloadURL:   fmt.Sprintf("/admin/wireguard-config/%s/%s", item.AccountNumber, item.ID),
+			QRURL:         fmt.Sprintf("/admin/wireguard-qr/%s/%s", item.AccountNumber, item.ID),
 		})
 	}
 	return out
+}
+
+func countHealthyGateways(items []domain.AdminGatewaySummary) int {
+	total := 0
+	for _, item := range items {
+		if !item.Active {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(item.LastStatus))
+		if status == "healthy" || status == "ok" {
+			total++
+		}
+	}
+	return total
 }
 
 func formatTS(t time.Time) string {

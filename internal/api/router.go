@@ -54,6 +54,7 @@ func NewRouterWithDeps(
 	mux.Handle("POST /admin/login", middleware.RateLimit(authRateLimiter, "admin-login", http.HandlerFunc(admin.LoginSubmit)))
 	mux.HandleFunc("GET /admin", admin.Dashboard)
 	mux.HandleFunc("GET /admin/wireguard-config/{account}/{device}", admin.DownloadWireGuardConfig)
+	mux.HandleFunc("GET /admin/wireguard-qr/{account}/{device}", admin.DownloadWireGuardQRCode)
 	mux.HandleFunc("POST /admin/logout", admin.Logout)
 
 	// Public compatibility API

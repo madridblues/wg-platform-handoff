@@ -115,3 +115,55 @@ func TestDownloadWireGuardConfig(t *testing.T) {
 		t.Fatalf("expected gateway endpoint in config")
 	}
 }
+
+func TestDownloadWireGuardQRCode(t *testing.T) {
+	store := newFakeStore()
+	store.devices = append(store.devices, domain.Device{
+		ID:          "dev-1",
+		Name:        "device-1",
+		PubKey:      "test-pubkey",
+		HijackDNS:   false,
+		Created:     time.Now().UTC(),
+		IPv4Address: "10.64.0.2/32",
+		IPv6Address: "fd00::2/128",
+	})
+
+	admin := NewAdminHandler(store, "topsecret", "session-secret", 1*time.Hour)
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/admin/login", strings.NewReader("password=topsecret"))
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRes := httptest.NewRecorder()
+	admin.LoginSubmit(loginRes, loginReq)
+	if loginRes.Code != http.StatusSeeOther {
+		t.Fatalf("expected login status 303, got %d", loginRes.Code)
+	}
+
+	var sessionCookie *http.Cookie
+	for _, cookie := range loginRes.Result().Cookies() {
+		if cookie.Name == adminSessionCookieName {
+			sessionCookie = cookie
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatalf("expected admin session cookie")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/wireguard-qr/ACC0001/dev-1?private_key=SGjouTg84AjrQtXgidUm6p7XlFi5c1rC4c%2BbSK25r10%3D", nil)
+	req = req.WithContext(context.Background())
+	req.SetPathValue("account", "ACC0001")
+	req.SetPathValue("device", "dev-1")
+	req.AddCookie(sessionCookie)
+
+	res := httptest.NewRecorder()
+	admin.DownloadWireGuardQRCode(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
+	}
+	if ct := res.Header().Get("Content-Type"); ct != "image/png" {
+		t.Fatalf("expected image/png content type, got %q", ct)
+	}
+	if body := res.Body.Bytes(); len(body) < 8 || string(body[:8]) != "\x89PNG\r\n\x1a\n" {
+		t.Fatalf("expected PNG body")
+	}
+}
