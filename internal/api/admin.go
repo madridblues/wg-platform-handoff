@@ -250,6 +250,7 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
                 <option value="split">Split tunnel</option>
               </select>
               <button type="button" onclick="generateKey('{{.AccountNumber}}','{{.DeviceID}}')">Generate key</button>
+              <button type="submit" formmethod="post" formaction="/admin/wireguard-config-auto/{{.AccountNumber}}/{{.DeviceID}}">Generate + Download</button>
               <button type="submit">Download</button>
               <button type="submit" formaction="{{.QRURL}}" formtarget="_blank">QR</button>
             </form>
@@ -434,6 +435,61 @@ func (h *AdminHandler) DownloadWireGuardConfig(w http.ResponseWriter, r *http.Re
 	filename := wireGuardFilename(device.AccountNumber, device.ID)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", filename, filename))
+	_, _ = w.Write([]byte(conf))
+}
+
+func (h *AdminHandler) GenerateAndDownloadWireGuardConfig(w http.ResponseWriter, r *http.Request) {
+	if !h.enabled() {
+		http.Error(w, "admin dashboard disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if !h.isAuthenticated(r) {
+		http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
+		return
+	}
+	backend, ok := h.store.(adminReadableStore)
+	if !ok {
+		http.Error(w, "admin backend unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	accountNumber := strings.TrimSpace(r.PathValue("account"))
+	deviceID := strings.TrimSpace(r.PathValue("device"))
+	if accountNumber == "" || deviceID == "" {
+		http.Error(w, "missing account/device path params", http.StatusBadRequest)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	mode := strings.TrimSpace(r.FormValue("mode"))
+
+	privateKey, publicKey, err := generateWireGuardKeypair()
+	if err != nil {
+		http.Error(w, "failed to generate wireguard keypair", http.StatusInternalServerError)
+		return
+	}
+	presharedKey, err := generateWireGuardPresharedKey()
+	if err != nil {
+		http.Error(w, "failed to generate wireguard preshared key", http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := backend.AdminReplaceDeviceKeyByAccountNumber(r.Context(), accountNumber, deviceID, publicKey, presharedKey); err != nil {
+		http.Error(w, "failed to sync generated key", http.StatusInternalServerError)
+		return
+	}
+
+	device, conf, err := h.buildWireGuardConfig(r.Context(), backend, accountNumber, deviceID, privateKey, mode)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	filename := wireGuardFilename(device.AccountNumber, device.ID)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 	_, _ = w.Write([]byte(conf))
 }
 
