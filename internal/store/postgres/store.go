@@ -488,7 +488,7 @@ values ($1::uuid, $2, $3::jsonb)
 		return fmt.Errorf("insert relay heartbeat: %w", err)
 	}
 
-	if err := s.updateDeviceRuntimeStatsFromMetrics(ctx, relayID, req.Metrics); err != nil {
+	if err := s.updateDeviceRuntimeStatsFromJSON(ctx, relayID, metrics); err != nil {
 		return fmt.Errorf("update device runtime stats: %w", err)
 	}
 
@@ -1130,21 +1130,32 @@ left join relays r on r.id = drs.relay_id;
 	return item, nil
 }
 
-func (s *Store) updateDeviceRuntimeStatsFromMetrics(ctx context.Context, relayID string, metrics map[string]any) error {
-	if len(metrics) == 0 {
-		return nil
-	}
-
-	peerItems := extractPeerMetrics(metrics["peers"])
-	if len(peerItems) == 0 {
+func (s *Store) updateDeviceRuntimeStatsFromJSON(ctx context.Context, relayID string, metricsJSON []byte) error {
+	if len(metricsJSON) == 0 {
 		return nil
 	}
 
 	const upsertQuery = `
+with peer_data as (
+    select
+        nullif(peer ->> 'public_key', '') as public_key,
+        nullif(peer ->> 'endpoint', '') as endpoint,
+        coalesce(nullif(peer ->> 'latest_handshake', '')::bigint, 0) as latest_handshake,
+        coalesce(nullif(peer ->> 'rx_bytes', '')::bigint, 0) as rx_bytes,
+        coalesce(nullif(peer ->> 'tx_bytes', '')::bigint, 0) as tx_bytes
+    from jsonb_array_elements(coalesce(($2::jsonb)->'peers', '[]'::jsonb)) peer
+)
 insert into device_runtime_stats (device_id, relay_id, endpoint, last_handshake_at, rx_bytes, tx_bytes, updated_at)
-select id, $2::uuid, nullif($3, ''), $4, $5, $6, now()
-from devices
-where pubkey = $1
+select
+    d.id,
+    $1::uuid,
+    p.endpoint,
+    case when p.latest_handshake > 0 then to_timestamp(p.latest_handshake) else null end,
+    p.rx_bytes,
+    p.tx_bytes,
+    now()
+from peer_data p
+join devices d on d.pubkey = p.public_key
 on conflict (device_id) do update
 set
     relay_id = excluded.relay_id,
@@ -1155,64 +1166,10 @@ set
     updated_at = now();
 `
 
-	for _, item := range peerItems {
-		publicKey := strings.TrimSpace(item.PublicKey)
-		if publicKey == "" {
-			continue
-		}
-
-		endpoint := strings.TrimSpace(item.Endpoint)
-		lastHandshake := toMetricTime(item.LatestHandshake)
-		rxBytes := toMetricInt64(item.RXBytes)
-		txBytes := toMetricInt64(item.TXBytes)
-
-		if _, err := s.db.ExecContext(ctx, upsertQuery, publicKey, relayID, endpoint, lastHandshake, rxBytes, txBytes); err != nil {
-			return fmt.Errorf("upsert device runtime stats: %w", err)
-		}
+	if _, err := s.db.ExecContext(ctx, upsertQuery, relayID, metricsJSON); err != nil {
+		return fmt.Errorf("upsert runtime stats from metrics json: %w", err)
 	}
-
 	return nil
-}
-
-type peerMetric struct {
-	PublicKey       string
-	Endpoint        string
-	LatestHandshake any
-	RXBytes         any
-	TXBytes         any
-}
-
-func extractPeerMetrics(value any) []peerMetric {
-	switch typed := value.(type) {
-	case []any:
-		out := make([]peerMetric, 0, len(typed))
-		for _, item := range typed {
-			if peerMap, ok := item.(map[string]any); ok {
-				out = append(out, peerMetric{
-					PublicKey:       toMetricString(peerMap["public_key"]),
-					Endpoint:        toMetricString(peerMap["endpoint"]),
-					LatestHandshake: peerMap["latest_handshake"],
-					RXBytes:         peerMap["rx_bytes"],
-					TXBytes:         peerMap["tx_bytes"],
-				})
-			}
-		}
-		return out
-	case []map[string]any:
-		out := make([]peerMetric, 0, len(typed))
-		for _, peerMap := range typed {
-			out = append(out, peerMetric{
-				PublicKey:       toMetricString(peerMap["public_key"]),
-				Endpoint:        toMetricString(peerMap["endpoint"]),
-				LatestHandshake: peerMap["latest_handshake"],
-				RXBytes:         peerMap["rx_bytes"],
-				TXBytes:         peerMap["tx_bytes"],
-			})
-		}
-		return out
-	default:
-		return nil
-	}
 }
 
 func (s *Store) resolveAccountIDForBilling(ctx context.Context, tx *sql.Tx, provider string, event domain.BillingEvent) (string, error) {
@@ -1339,100 +1296,6 @@ func isSQLState(err error, sqlState string) bool {
 		return false
 	}
 	return pgErr.Code == sqlState
-}
-
-func toMetricString(value any) string {
-	switch typed := value.(type) {
-	case string:
-		return typed
-	case fmt.Stringer:
-		return typed.String()
-	default:
-		return ""
-	}
-}
-
-func toMetricInt64(value any) int64 {
-	switch typed := value.(type) {
-	case int:
-		return int64(typed)
-	case int64:
-		return typed
-	case int32:
-		return int64(typed)
-	case float64:
-		return int64(typed)
-	case float32:
-		return int64(typed)
-	case json.Number:
-		if v, err := typed.Int64(); err == nil {
-			return v
-		}
-		if v, err := typed.Float64(); err == nil {
-			return int64(v)
-		}
-	case string:
-		v := strings.TrimSpace(typed)
-		if v == "" {
-			return 0
-		}
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return parsed
-		}
-		if parsed, err := strconv.ParseFloat(v, 64); err == nil {
-			return int64(parsed)
-		}
-	}
-	return 0
-}
-
-func toMetricTime(value any) any {
-	switch typed := value.(type) {
-	case time.Time:
-		t := typed.UTC()
-		return t
-	case float64:
-		if typed <= 0 {
-			return nil
-		}
-		t := time.Unix(int64(typed), 0).UTC()
-		return t
-	case int64:
-		if typed <= 0 {
-			return nil
-		}
-		t := time.Unix(typed, 0).UTC()
-		return t
-	case int:
-		if typed <= 0 {
-			return nil
-		}
-		t := time.Unix(int64(typed), 0).UTC()
-		return t
-	case json.Number:
-		if v, err := typed.Int64(); err == nil && v > 0 {
-			t := time.Unix(v, 0).UTC()
-			return t
-		}
-		if v, err := typed.Float64(); err == nil && v > 0 {
-			t := time.Unix(int64(v), 0).UTC()
-			return t
-		}
-	case string:
-		v := strings.TrimSpace(typed)
-		if v == "" {
-			return nil
-		}
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
-			t := time.Unix(parsed, 0).UTC()
-			return t
-		}
-		if parsed, err := time.Parse(time.RFC3339, v); err == nil {
-			t := parsed.UTC()
-			return t
-		}
-	}
-	return nil
 }
 
 func generateAccountNumber() string {
