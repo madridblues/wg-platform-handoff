@@ -827,11 +827,24 @@ select
     a.created_at,
     coalesce((h.metrics->>'configured_peers')::bigint, 0)::bigint,
     coalesce((
-        select count(*)
-        from device_runtime_stats drs
-        where drs.relay_id = r.id
-          and drs.last_handshake_at > now() - interval '3 minutes'
+        select sum(
+            case
+                when coalesce((peer ->> 'latest_handshake')::bigint, 0) > extract(epoch from now() - interval '3 minutes')
+                then 1 else 0
+            end
+        )::bigint
+        from jsonb_array_elements(coalesce(h.metrics->'peers', '[]'::jsonb)) peer
     ), 0)::bigint as connected_peers
+    ,
+    coalesce((
+        select sum(coalesce((peer ->> 'rx_bytes')::bigint, 0))::bigint
+        from jsonb_array_elements(coalesce(h.metrics->'peers', '[]'::jsonb)) peer
+    ), 0)::bigint as live_rx_bytes
+    ,
+    coalesce((
+        select sum(coalesce((peer ->> 'tx_bytes')::bigint, 0))::bigint
+        from jsonb_array_elements(coalesce(h.metrics->'peers', '[]'::jsonb)) peer
+    ), 0)::bigint as live_tx_bytes
 from relays r
 left join lateral (
     select status, received_at, metrics
@@ -881,6 +894,8 @@ limit $1;
 			&lastApplyAt,
 			&item.ConfiguredPeers,
 			&item.ConnectedPeers,
+			&item.LiveRXBytes,
+			&item.LiveTXBytes,
 		); err != nil {
 			return nil, fmt.Errorf("admin scan gateway: %w", err)
 		}

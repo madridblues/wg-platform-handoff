@@ -34,6 +34,8 @@ type AdminGatewaySummary struct {
 	LastApplyAt   *time.Time
 	ConfiguredPeers int64
 	ConnectedPeers  int64
+	LiveRXBytes     int64
+	LiveTXBytes     int64
 }
 
 type AdminDeviceSummary struct {

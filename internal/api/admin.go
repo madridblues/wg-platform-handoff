@@ -88,6 +88,7 @@ type adminGatewayRow struct {
 	LastHeartbeatRel  string
 	LastApply         string
 	Load              string
+	LiveTraffic       string
 }
 
 type adminDeviceRow struct {
@@ -191,7 +192,7 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
       <thead>
         <tr>
           <th>Hostname</th><th>Region</th><th>Provider</th><th>Port</th><th>Active</th>
-          <th>Public IPv4</th><th>Status</th><th>Load</th><th>Last Heartbeat</th><th>Last Apply</th>
+          <th>Public IPv4</th><th>Status</th><th>Load</th><th>Live Traffic</th><th>Last Heartbeat</th><th>Last Apply</th>
         </tr>
       </thead>
       <tbody>
@@ -201,6 +202,7 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
           <td>{{.PublicIPv4}}</td>
           <td><span class="status"><span class="dot {{.LastStatusClass}}"></span>{{.LastStatus}}</span></td>
           <td>{{.Load}}</td>
+          <td>{{.LiveTraffic}}</td>
           <td>{{.LastHeartbeatRel}}<div class="hint">{{.LastHeartbeat}}</div></td>
           <td>{{.LastApply}}</td>
         </tr>
@@ -386,7 +388,7 @@ func (h *AdminHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		TotalDevices:       len(devices),
 		TotalGateways:      len(gateways),
 		HealthyGateways:    countHealthyGateways(gateways),
-		ActiveConnections:  countConnectedDevices(devices),
+		ActiveConnections:  countConnectedPeers(gateways),
 		PaidAccounts:       countPaidAccounts(accounts),
 		ObservedTraffic:    formatBytes(totalTrafficBytes(accounts)),
 		GatewayUtilization: summarizeGatewayUtilization(gateways),
@@ -902,6 +904,7 @@ func toAdminGatewayRows(items []domain.AdminGatewaySummary) []adminGatewayRow {
 		} else if item.ConnectedPeers > 0 {
 			load = fmt.Sprintf("%d connected", item.ConnectedPeers)
 		}
+		liveTraffic := fmt.Sprintf("RX %s / TX %s", formatBytes(item.LiveRXBytes), formatBytes(item.LiveTXBytes))
 
 		out = append(out, adminGatewayRow{
 			Hostname:         item.Hostname,
@@ -917,6 +920,7 @@ func toAdminGatewayRows(items []domain.AdminGatewaySummary) []adminGatewayRow {
 			LastHeartbeatRel: heartbeatRelative,
 			LastApply:        lastApply,
 			Load:             load,
+			LiveTraffic:      liveTraffic,
 		})
 	}
 	return out
@@ -1021,6 +1025,14 @@ func countConnectedDevices(items []domain.AdminDeviceSummary) int {
 		if item.Connected {
 			total++
 		}
+	}
+	return total
+}
+
+func countConnectedPeers(items []domain.AdminGatewaySummary) int {
+	total := 0
+	for _, item := range items {
+		total += int(item.ConnectedPeers)
 	}
 	return total
 }
