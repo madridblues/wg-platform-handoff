@@ -218,21 +218,22 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
   </div>
   <script>
     async function generateKey(account, device) {
-      const msg = document.getElementById(`msg-${device}`);
-      const input = document.getElementById(`pk-${device}`);
+      const msg = document.getElementById('msg-' + device);
+      const input = document.getElementById('pk-' + device);
       if (!msg || !input) return;
       msg.textContent = 'Generating key...';
       try {
-        const res = await fetch(`/admin/wireguard-key/${encodeURIComponent(account)}/${encodeURIComponent(device)}/generate`, { method: 'POST' });
+        const path = '/admin/wireguard-key/' + encodeURIComponent(account) + '/' + encodeURIComponent(device) + '/generate';
+        const res = await fetch(path, { method: 'POST' });
         if (!res.ok) {
           const text = await res.text();
-          throw new Error(text || `HTTP ${res.status}`);
+          throw new Error(text || ('HTTP ' + res.status));
         }
         const payload = await res.json();
         input.value = payload.private_key || '';
         msg.textContent = 'Key generated and synced to device.';
       } catch (err) {
-        msg.textContent = `Key generation failed: ${err.message}`;
+        msg.textContent = 'Key generation failed: ' + err.message;
       }
     }
   </script>
