@@ -1,0 +1,15 @@
+# Required
+vultr_api_key            = "<set-in-workspace-or-cli-var>"
+gateway_token            = "<shared-internal-gateway-token>"
+control_plane_base_url   = "https://api.example.com"
+gateway_agent_url        = "https://artifacts.example.com/gateway-agent-linux-amd64"
+
+# Optional
+gateway_agent_sha256 = ""
+gateway_id           = "gw-lon-1"
+gateway_region_slug  = "eu-west"
+gateway_provider     = "vultr"
+vultr_region         = "lhr"
+vultr_plan           = "vc2-1c-1gb"
+vultr_os_id          = 1743
+ssh_key_ids          = []

@@ -1,0 +1,23 @@
+#cloud-config
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+
+write_files:
+  - path: /tmp/install-gateway.sh
+    permissions: "0755"
+    encoding: b64
+    content: ${gateway_install_script_b64}
+
+runcmd:
+  - |
+    CONTROL_PLANE_BASE_URL="${control_plane_base_url}" \
+    GATEWAY_ID="${gateway_id}" \
+    GATEWAY_REGION="${gateway_region}" \
+    GATEWAY_PROVIDER="${gateway_provider}" \
+    GATEWAY_TOKEN="${gateway_token}" \
+    GATEWAY_PUBLIC_IPV4="$(curl -fsS --max-time 5 https://api.ipify.org || true)" \
+    GATEWAY_AGENT_URL="${gateway_agent_url}" \
+    GATEWAY_AGENT_SHA256="${gateway_agent_sha256}" \
+    /tmp/install-gateway.sh

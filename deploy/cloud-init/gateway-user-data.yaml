@@ -1,0 +1,47 @@
+#cloud-config
+package_update: true
+packages:
+  - wireguard
+  - wireguard-tools
+  - iproute2
+  - curl
+  - jq
+
+write_files:
+  - path: /etc/systemd/system/gateway-agent.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Gateway Agent
+      After=network-online.target
+
+      [Service]
+      Environment=CONTROL_PLANE_BASE_URL=${control_plane_base_url}
+      Environment=GATEWAY_ID=${gateway_id}
+      Environment=GATEWAY_REGION=${gateway_region}
+      Environment=GATEWAY_PROVIDER=${gateway_provider}
+      Environment=GATEWAY_TOKEN=${gateway_token}
+      Environment=GATEWAY_PUBLIC_IPV4=${gateway_public_ipv4}
+      Environment=GATEWAY_PUBLIC_IPV6=${gateway_public_ipv6}
+      Environment=GATEWAY_WG_INTERFACE=wg0
+      Environment=GATEWAY_WG_PRIVATE_KEY_PATH=/etc/wireguard/privatekey
+      Environment=GATEWAY_WG_ADDRESS_IPV4=${gateway_wg_address_ipv4}
+      Environment=GATEWAY_WG_ADDRESS_IPV6=${gateway_wg_address_ipv6}
+      Environment=GATEWAY_WG_LISTEN_PORT=51820
+      Environment=GATEWAY_WG_APPLY_ENABLED=true
+      Environment=GATEWAY_WG_CONFIG_DIR=/run/wg-platform
+      ExecStart=/usr/local/bin/gateway-agent
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - mkdir -p /etc/wireguard
+  - chmod 700 /etc/wireguard
+  - test -f /etc/wireguard/privatekey || (wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey)
+  - chmod 600 /etc/wireguard/privatekey /etc/wireguard/publickey
+  - systemctl daemon-reload
+  - systemctl enable gateway-agent
+  - systemctl restart gateway-agent

@@ -1,0 +1,7 @@
+name = "wg-platform-webhooks"
+compatibility_date = "2026-03-13"
+
+[vars]
+CONTROL_PLANE_BASE_URL = "https://control-plane.example.com"
+# Optional: set in Cloudflare dashboard as secret
+# CONTROL_PLANE_PROXY_TOKEN = "..."

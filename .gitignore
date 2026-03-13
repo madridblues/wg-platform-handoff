@@ -1,0 +1,21 @@
+# Local environment/secrets
+.env
+*.local
+
+# Terraform local overrides/state
+*.tfvars
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Go caches/modules in workspace
+.gocache/
+.gomodcache/
+
+# Build artifacts
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib

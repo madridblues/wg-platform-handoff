@@ -1,0 +1,1006 @@
+package postgres
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"wg-platform-handoff/internal/domain"
+)
+
+var errNotFound = errors.New("not found")
+
+type Store struct {
+	db *sql.DB
+}
+
+func New(databaseURL string) (*Store, error) {
+	if strings.TrimSpace(databaseURL) == "" {
+		return nil, errors.New("DATABASE_URL is required")
+	}
+
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping db: %w", err)
+	}
+
+	return &Store{db: db}, nil
+}
+
+func (s *Store) GetOrCreateAccountByUserID(ctx context.Context, userID string) (domain.Account, error) {
+	if strings.TrimSpace(userID) == "" {
+		return domain.Account{}, errors.New("missing user id")
+	}
+
+	accountNumber := generateAccountNumber()
+
+	const query = `
+with inserted as (
+    insert into accounts (account_number, supabase_user_id, status, expiry_at)
+    values ($1, $2::uuid, 'active', now() + interval '30 days')
+    on conflict (supabase_user_id) do nothing
+    returning id::text, account_number, status, expiry_at
+)
+select id, account_number, status, expiry_at from inserted
+union all
+select id::text, account_number, status, expiry_at
+from accounts
+where supabase_user_id = $2::uuid
+limit 1;
+`
+
+	var account domain.Account
+	err := s.db.QueryRowContext(ctx, query, accountNumber, userID).Scan(&account.ID, &account.Number, &account.Status, &account.Expiry)
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("resolve account: %w", err)
+	}
+
+	return account, nil
+}
+
+func (s *Store) GetAccountByNumber(ctx context.Context, accountNumber string) (domain.Account, error) {
+	accountNumber = strings.TrimSpace(accountNumber)
+	if accountNumber == "" {
+		return domain.Account{}, errors.New("missing account number")
+	}
+
+	const query = `
+select id::text, account_number, status, expiry_at
+from accounts
+where account_number = $1
+limit 1;
+`
+
+	var account domain.Account
+	err := s.db.QueryRowContext(ctx, query, accountNumber).Scan(&account.ID, &account.Number, &account.Status, &account.Expiry)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Account{}, errNotFound
+	}
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("get account by number: %w", err)
+	}
+
+	return account, nil
+}
+
+func (s *Store) ListDevices(ctx context.Context, accountID string) ([]domain.Device, error) {
+	const query = `
+select
+    id::text,
+    name,
+    pubkey,
+    hijack_dns,
+    created_at,
+    ipv4_address::text,
+    ipv6_address::text
+from devices
+where account_id = $1::uuid
+order by created_at desc;
+`
+
+	rows, err := s.db.QueryContext(ctx, query, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("list devices: %w", err)
+	}
+	defer rows.Close()
+
+	devices := make([]domain.Device, 0)
+	for rows.Next() {
+		var d domain.Device
+		if err := rows.Scan(&d.ID, &d.Name, &d.PubKey, &d.HijackDNS, &d.Created, &d.IPv4Address, &d.IPv6Address); err != nil {
+			return nil, fmt.Errorf("scan device: %w", err)
+		}
+		devices = append(devices, d)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate devices: %w", err)
+	}
+
+	return devices, nil
+}
+
+func (s *Store) CreateDevice(ctx context.Context, accountID, pubkey string, hijackDNS bool) (domain.Device, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Device{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	name := "device-" + uuid.NewString()[:8]
+
+	const query = `
+insert into devices (account_id, name, pubkey, hijack_dns, ipv4_address, ipv6_address)
+values ($1::uuid, $2, $3, $4, $5::cidr, $6::cidr)
+returning id::text, name, pubkey, hijack_dns, created_at, ipv4_address::text, ipv6_address::text;
+`
+
+	const maxAttempts = 24
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		slot, err := s.allocateDeviceSlot(ctx, tx)
+		if err != nil {
+			return domain.Device{}, err
+		}
+
+		ipv4, ipv6, err := nextDeviceAddressesForSlot(slot)
+		if err != nil {
+			return domain.Device{}, err
+		}
+
+		var d domain.Device
+		err = tx.QueryRowContext(ctx, query, accountID, name, pubkey, hijackDNS, ipv4, ipv6).Scan(
+			&d.ID,
+			&d.Name,
+			&d.PubKey,
+			&d.HijackDNS,
+			&d.Created,
+			&d.IPv4Address,
+			&d.IPv6Address,
+		)
+		if err == nil {
+			if commitErr := tx.Commit(); commitErr != nil {
+				return domain.Device{}, fmt.Errorf("commit create device: %w", commitErr)
+			}
+			return d, nil
+		}
+
+		if shouldRetryDeviceAddressCollision(err) {
+			continue
+		}
+
+		return domain.Device{}, fmt.Errorf("create device: %w", err)
+	}
+
+	return domain.Device{}, errors.New("failed to allocate unique device address slot")
+}
+
+func (s *Store) GetDevice(ctx context.Context, accountID, deviceID string) (domain.Device, error) {
+	const query = `
+select
+    id::text,
+    name,
+    pubkey,
+    hijack_dns,
+    created_at,
+    ipv4_address::text,
+    ipv6_address::text
+from devices
+where id = $1::uuid and account_id = $2::uuid;
+`
+
+	var d domain.Device
+	err := s.db.QueryRowContext(ctx, query, deviceID, accountID).Scan(
+		&d.ID,
+		&d.Name,
+		&d.PubKey,
+		&d.HijackDNS,
+		&d.Created,
+		&d.IPv4Address,
+		&d.IPv6Address,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Device{}, errNotFound
+	}
+	if err != nil {
+		return domain.Device{}, fmt.Errorf("get device: %w", err)
+	}
+
+	return d, nil
+}
+
+func (s *Store) ReplaceDeviceKey(ctx context.Context, accountID, deviceID, pubkey string) (domain.Device, error) {
+	const query = `
+update devices
+set pubkey = $1, updated_at = now()
+where id = $2::uuid and account_id = $3::uuid
+returning id::text, name, pubkey, hijack_dns, created_at, ipv4_address::text, ipv6_address::text;
+`
+
+	var d domain.Device
+	err := s.db.QueryRowContext(ctx, query, pubkey, deviceID, accountID).Scan(
+		&d.ID,
+		&d.Name,
+		&d.PubKey,
+		&d.HijackDNS,
+		&d.Created,
+		&d.IPv4Address,
+		&d.IPv6Address,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Device{}, errNotFound
+	}
+	if err != nil {
+		return domain.Device{}, fmt.Errorf("replace device key: %w", err)
+	}
+
+	return d, nil
+}
+
+func (s *Store) DeleteDevice(ctx context.Context, accountID, deviceID string) error {
+	result, err := s.db.ExecContext(ctx, `delete from devices where id = $1::uuid and account_id = $2::uuid`, deviceID, accountID)
+	if err != nil {
+		return fmt.Errorf("delete device: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete device rows affected: %w", err)
+	}
+	if affected == 0 {
+		return errNotFound
+	}
+
+	return nil
+}
+
+func (s *Store) CurrentRelayList(ctx context.Context) (domain.RelayListResponse, string, error) {
+	const relayQuery = `
+select
+    region,
+    hostname,
+    public_ipv4::text,
+    coalesce(public_ipv6::text, ''),
+    active,
+    weight,
+    provider,
+    coalesce(wg_public_key, '')
+from relays
+where active = true and coalesce(wg_public_key, '') <> ''
+order by region, hostname;
+`
+
+	rows, err := s.db.QueryContext(ctx, relayQuery)
+	if err != nil {
+		return domain.RelayListResponse{}, "", fmt.Errorf("list relays: %w", err)
+	}
+	defer rows.Close()
+
+	relayEntries := make([]domain.WireguardRelayEntry, 0)
+	locations := map[string]domain.RelayLocation{}
+
+	for rows.Next() {
+		var (
+			region    string
+			hostname  string
+			ipv4      string
+			ipv6      string
+			active    bool
+			weight    int
+			provider  string
+			publicKey string
+		)
+
+		if err := rows.Scan(&region, &hostname, &ipv4, &ipv6, &active, &weight, &provider, &publicKey); err != nil {
+			return domain.RelayListResponse{}, "", fmt.Errorf("scan relay: %w", err)
+		}
+
+		if _, exists := locations[region]; !exists {
+			city, country := locationFromRegion(region)
+			locations[region] = domain.RelayLocation{City: city, Country: country, Latitude: 0, Longitude: 0}
+		}
+
+		relayEntries = append(relayEntries, domain.WireguardRelayEntry{
+			Hostname:   hostname,
+			Active:     active,
+			Owned:      provider == "self",
+			Location:   region,
+			Provider:   provider,
+			IPv4AddrIn: ipv4,
+			IPv6AddrIn: ipv6,
+			Weight:     weight,
+			IncludeInC: true,
+			PublicKey:  publicKey,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return domain.RelayListResponse{}, "", fmt.Errorf("iterate relays: %w", err)
+	}
+
+	var etagVersion string
+	if err := s.db.QueryRowContext(ctx, `select coalesce(to_char(max(updated_at), 'YYYYMMDDHH24MISSUS'), '0') from relays`).Scan(&etagVersion); err != nil {
+		return domain.RelayListResponse{}, "", fmt.Errorf("relay etag version: %w", err)
+	}
+
+	relayList := domain.RelayListResponse{
+		Locations: locations,
+		Wireguard: domain.WireguardBlock{
+			PortRanges: [][]uint16{{51820, 51830}},
+			IPv4GW:     "10.64.0.1",
+			IPv6GW:     "fd00::1",
+			Relays:     relayEntries,
+		},
+		Bridge: domain.BridgeBlock{},
+	}
+
+	etag := fmt.Sprintf(`W/"relay-%s-%d"`, etagVersion, len(relayEntries))
+	return relayList, etag, nil
+}
+
+func (s *Store) RegisterGateway(ctx context.Context, req domain.GatewayRegisterRequest) error {
+	gatewayID := strings.TrimSpace(req.ID)
+	if gatewayID == "" {
+		return errors.New("gateway id required")
+	}
+
+	region := strings.TrimSpace(req.Region)
+	if region == "" {
+		region = "unknown"
+	}
+
+	provider := strings.TrimSpace(req.Metadata["provider"])
+	if provider == "" {
+		provider = "self"
+	}
+
+	publicIPv4 := strings.TrimSpace(req.Metadata["public_ipv4"])
+	if publicIPv4 == "" {
+		publicIPv4 = "203.0.113.10"
+	}
+
+	publicIPv6 := strings.TrimSpace(req.Metadata["public_ipv6"])
+	publicKey := strings.TrimSpace(req.Metadata["wg_public_key"])
+
+	const query = `
+insert into relays (region, hostname, public_ipv4, public_ipv6, wg_port, active, weight, provider, wg_public_key)
+values ($1, $2, $3::inet, nullif($4, '')::inet, 51820, true, 100, $5, nullif($6, ''))
+on conflict (hostname) do update
+set
+    region = excluded.region,
+    public_ipv4 = excluded.public_ipv4,
+    public_ipv6 = excluded.public_ipv6,
+    active = true,
+    provider = excluded.provider,
+    wg_public_key = excluded.wg_public_key,
+    updated_at = now();
+`
+
+	if _, err := s.db.ExecContext(ctx, query, region, gatewayID, publicIPv4, publicIPv6, provider, publicKey); err != nil {
+		return fmt.Errorf("register gateway: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) DesiredGatewayConfig(ctx context.Context, gatewayID string) (domain.GatewayDesiredConfigResponse, error) {
+	const peerQuery = `
+select pubkey, ipv4_address::text, ipv6_address::text
+from devices
+order by created_at desc
+limit 2000;
+`
+
+	rows, err := s.db.QueryContext(ctx, peerQuery)
+	if err != nil {
+		return domain.GatewayDesiredConfigResponse{}, fmt.Errorf("query desired peers: %w", err)
+	}
+	defer rows.Close()
+
+	peers := make([]map[string]any, 0)
+	for rows.Next() {
+		var (
+			pubkey string
+			ipv4   string
+			ipv6   string
+		)
+		if err := rows.Scan(&pubkey, &ipv4, &ipv6); err != nil {
+			return domain.GatewayDesiredConfigResponse{}, fmt.Errorf("scan desired peer: %w", err)
+		}
+
+		peers = append(peers, map[string]any{
+			"public_key":  pubkey,
+			"allowed_ips": []string{ipv4, ipv6},
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return domain.GatewayDesiredConfigResponse{}, fmt.Errorf("iterate desired peers: %w", err)
+	}
+
+	relayConfig := map[string]string{"gateway_id": gatewayID}
+	var listenPort int
+	if err := s.db.QueryRowContext(ctx, `select wg_port from relays where hostname = $1`, gatewayID).Scan(&listenPort); err == nil && listenPort > 0 {
+		relayConfig["listen_port"] = strconv.Itoa(listenPort)
+	}
+
+	return domain.GatewayDesiredConfigResponse{
+		Version: time.Now().UTC().Unix(),
+		Peers:   peers,
+		Relay:   relayConfig,
+	}, nil
+}
+
+func (s *Store) HeartbeatGateway(ctx context.Context, gatewayID string, req domain.GatewayHeartbeatRequest) error {
+	relayID, err := s.relayIDByHostname(ctx, gatewayID)
+	if err != nil {
+		return err
+	}
+
+	status := strings.TrimSpace(req.Status)
+	if status == "" {
+		status = "unknown"
+	}
+
+	metrics, err := json.Marshal(req.Metrics)
+	if err != nil {
+		return fmt.Errorf("marshal heartbeat metrics: %w", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx, `
+insert into relay_heartbeats (relay_id, status, metrics)
+values ($1::uuid, $2, $3::jsonb)
+`, relayID, status, metrics); err != nil {
+		return fmt.Errorf("insert relay heartbeat: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) RecordGatewayApplyResult(ctx context.Context, gatewayID string, req domain.GatewayApplyResultRequest) error {
+	relayID, err := s.relayIDByHostname(ctx, gatewayID)
+	if err != nil {
+		return err
+	}
+
+	const query = `
+insert into gateway_apply_events (relay_id, desired_version, result, error_text)
+values ($1::uuid, $2, $3, $4)
+on conflict (relay_id, desired_version) do update
+set
+    result = excluded.result,
+    error_text = excluded.error_text,
+    created_at = now();
+`
+
+	if _, err := s.db.ExecContext(ctx, query, relayID, req.DesiredVersion, req.Result, req.ErrorText); err != nil {
+		return fmt.Errorf("record gateway apply result: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) ApplyBillingEvent(ctx context.Context, event domain.BillingEvent) error {
+	provider := normalizeProvider(event.Provider)
+	if provider == "" {
+		return errors.New("billing provider required")
+	}
+
+	rawPayload := event.Raw
+	if rawPayload == nil {
+		rawPayload = map[string]any{}
+	}
+
+	rawJSON, err := json.Marshal(rawPayload)
+	if err != nil {
+		return fmt.Errorf("marshal billing payload: %w", err)
+	}
+
+	eventID := strings.TrimSpace(event.EventID)
+	if eventID == "" {
+		sum := sha256.Sum256(rawJSON)
+		eventID = fmt.Sprintf("%s-%s", provider, hex.EncodeToString(sum[:12]))
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin billing tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	inserted, err := s.markBillingEventReceived(ctx, tx, provider, eventID, event.EventType, rawJSON)
+	if err != nil {
+		return err
+	}
+	if !inserted {
+		if commitErr := tx.Commit(); commitErr != nil {
+			return fmt.Errorf("commit duplicate billing tx: %w", commitErr)
+		}
+		return nil
+	}
+
+	accountID, err := s.resolveAccountIDForBilling(ctx, tx, provider, event)
+	if errors.Is(err, errNotFound) {
+		// Unknown account mapping: ignore for now and let future events reconcile.
+		if commitErr := tx.Commit(); commitErr != nil {
+			return fmt.Errorf("commit ignored billing tx: %w", commitErr)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	subscriptionID := strings.TrimSpace(event.SubscriptionID)
+	if subscriptionID == "" {
+		subscriptionID = "unknown-" + provider
+	}
+
+	customerID := strings.TrimSpace(event.CustomerID)
+	if customerID == "" {
+		customerID = "unknown-" + provider
+	}
+
+	normalizedStatus := normalizeBillingStatus(event.Status, event.EventType)
+
+	var periodEnd any
+	if event.CurrentPeriodEnd != nil {
+		periodEnd = event.CurrentPeriodEnd.UTC()
+	}
+
+	const upsertSubscription = `
+insert into subscriptions (
+    account_id,
+    provider,
+    external_customer_id,
+    external_subscription_id,
+    status,
+    current_period_end,
+    last_webhook_event_id,
+    updated_at
+)
+values (
+    $1::uuid,
+    $2,
+    $3,
+    $4,
+    $5,
+    $6,
+    $7,
+    now()
+)
+on conflict (provider, external_subscription_id) do update
+set
+    account_id = excluded.account_id,
+    external_customer_id = excluded.external_customer_id,
+    status = excluded.status,
+    current_period_end = excluded.current_period_end,
+    last_webhook_event_id = excluded.last_webhook_event_id,
+    updated_at = now();
+`
+
+	if _, err := tx.ExecContext(ctx, upsertSubscription, accountID, provider, customerID, subscriptionID, normalizedStatus, periodEnd, eventID); err != nil {
+		return fmt.Errorf("upsert subscription: %w", err)
+	}
+
+	accountStatus := accountStatusFromBillingStatus(normalizedStatus)
+	var expiry any
+	if event.CurrentPeriodEnd != nil {
+		expiry = event.CurrentPeriodEnd.UTC()
+	} else if accountStatus == "suspended" {
+		expiry = time.Now().UTC()
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+update accounts
+set
+    status = $2,
+    expiry_at = coalesce($3::timestamptz, expiry_at),
+    updated_at = now()
+where id = $1::uuid
+`, accountID, accountStatus, expiry); err != nil {
+		return fmt.Errorf("update account entitlement: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit billing tx: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) markBillingEventReceived(ctx context.Context, tx *sql.Tx, provider, eventID, eventType string, payload []byte) (bool, error) {
+	const query = `
+insert into billing_webhook_events (provider, event_id, event_type, payload)
+values ($1, $2, $3, $4::jsonb)
+on conflict (provider, event_id) do nothing;
+`
+
+	result, err := tx.ExecContext(ctx, query, provider, eventID, eventType, payload)
+	if err != nil {
+		return false, fmt.Errorf("insert billing webhook event: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("billing webhook rows affected: %w", err)
+	}
+
+	return affected > 0, nil
+}
+
+func (s *Store) RecordAuditEvent(ctx context.Context, event domain.AuditEvent) error {
+	actorType := strings.TrimSpace(event.ActorType)
+	if actorType == "" {
+		actorType = "system"
+	}
+
+	actorID := strings.TrimSpace(event.ActorID)
+	if actorID == "" {
+		actorID = "unknown"
+	}
+
+	action := strings.TrimSpace(event.Action)
+	if action == "" {
+		action = "unknown"
+	}
+
+	entityType := strings.TrimSpace(event.EntityType)
+	if entityType == "" {
+		entityType = "unknown"
+	}
+
+	entityID := strings.TrimSpace(event.EntityID)
+
+	payload := event.Payload
+	if payload == nil {
+		payload = map[string]any{}
+	}
+
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal audit payload: %w", err)
+	}
+
+	const query = `
+insert into audit_events (actor_type, actor_id, action, entity_type, entity_id, payload)
+values ($1, $2, $3, $4, nullif($5, ''), $6::jsonb);
+`
+
+	if _, err := s.db.ExecContext(ctx, query, actorType, actorID, action, entityType, entityID, payloadJSON); err != nil {
+		return fmt.Errorf("insert audit event: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) AdminListAccounts(ctx context.Context, limit int) ([]domain.AdminAccountSummary, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+
+	const query = `
+select
+    a.id::text,
+    a.account_number,
+    a.supabase_user_id::text,
+    a.status,
+    a.expiry_at,
+    a.updated_at,
+    count(d.id)::bigint as device_count
+from accounts a
+left join devices d on d.account_id = a.id
+group by a.id, a.account_number, a.supabase_user_id, a.status, a.expiry_at, a.updated_at
+order by a.updated_at desc
+limit $1;
+`
+
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("admin list accounts: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]domain.AdminAccountSummary, 0)
+	for rows.Next() {
+		var item domain.AdminAccountSummary
+		if err := rows.Scan(
+			&item.ID,
+			&item.AccountNumber,
+			&item.SupabaseUserID,
+			&item.Status,
+			&item.Expiry,
+			&item.UpdatedAt,
+			&item.DeviceCount,
+		); err != nil {
+			return nil, fmt.Errorf("admin scan account: %w", err)
+		}
+		out = append(out, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("admin iterate accounts: %w", err)
+	}
+
+	return out, nil
+}
+
+func (s *Store) AdminListGateways(ctx context.Context, limit int) ([]domain.AdminGatewaySummary, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+
+	const query = `
+select
+    r.id::text,
+    r.hostname,
+    r.region,
+    r.provider,
+    r.active,
+    r.public_ipv4::text,
+    coalesce(r.public_ipv6::text, ''),
+    coalesce(r.wg_public_key, ''),
+    coalesce(h.status, 'unknown'),
+    h.received_at
+from relays r
+left join lateral (
+    select status, received_at
+    from relay_heartbeats rh
+    where rh.relay_id = r.id
+    order by rh.received_at desc
+    limit 1
+) h on true
+order by r.updated_at desc
+limit $1;
+`
+
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("admin list gateways: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]domain.AdminGatewaySummary, 0)
+	for rows.Next() {
+		var (
+			item          domain.AdminGatewaySummary
+			lastHeartbeat sql.NullTime
+		)
+
+		if err := rows.Scan(
+			&item.ID,
+			&item.Hostname,
+			&item.Region,
+			&item.Provider,
+			&item.Active,
+			&item.PublicIPv4,
+			&item.PublicIPv6,
+			&item.WGPublicKey,
+			&item.LastStatus,
+			&lastHeartbeat,
+		); err != nil {
+			return nil, fmt.Errorf("admin scan gateway: %w", err)
+		}
+
+		if lastHeartbeat.Valid {
+			t := lastHeartbeat.Time.UTC()
+			item.LastHeartbeat = &t
+		}
+
+		out = append(out, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("admin iterate gateways: %w", err)
+	}
+
+	return out, nil
+}
+
+func (s *Store) resolveAccountIDForBilling(ctx context.Context, tx *sql.Tx, provider string, event domain.BillingEvent) (string, error) {
+	if accountNumber := strings.TrimSpace(event.AccountNumber); accountNumber != "" {
+		var accountID string
+		err := tx.QueryRowContext(ctx, `select id::text from accounts where account_number = $1`, accountNumber).Scan(&accountID)
+		if err == nil {
+			return accountID, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("lookup account by number: %w", err)
+		}
+	}
+
+	if subscriptionID := strings.TrimSpace(event.SubscriptionID); subscriptionID != "" {
+		var accountID string
+		err := tx.QueryRowContext(ctx, `
+select account_id::text
+from subscriptions
+where provider = $1 and external_subscription_id = $2
+limit 1
+`, provider, subscriptionID).Scan(&accountID)
+		if err == nil {
+			return accountID, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("lookup account by subscription: %w", err)
+		}
+	}
+
+	if customerID := strings.TrimSpace(event.CustomerID); customerID != "" {
+		var accountID string
+		err := tx.QueryRowContext(ctx, `
+select account_id::text
+from subscriptions
+where provider = $1 and external_customer_id = $2
+order by updated_at desc
+limit 1
+`, provider, customerID).Scan(&accountID)
+		if err == nil {
+			return accountID, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("lookup account by customer: %w", err)
+		}
+	}
+
+	return "", errNotFound
+}
+
+func (s *Store) relayIDByHostname(ctx context.Context, hostname string) (string, error) {
+	var relayID string
+	err := s.db.QueryRowContext(ctx, `select id::text from relays where hostname = $1`, hostname).Scan(&relayID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("relay %q not found", hostname)
+	}
+	if err != nil {
+		return "", fmt.Errorf("lookup relay by hostname: %w", err)
+	}
+	return relayID, nil
+}
+
+func (s *Store) allocateDeviceSlot(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var slot int64
+	err := tx.QueryRowContext(ctx, `select nextval('device_ip_slot_seq')`).Scan(&slot)
+	if err == nil {
+		return slot, nil
+	}
+
+	if !isSQLState(err, "42P01") && !isSQLState(err, "42704") {
+		return 0, fmt.Errorf("allocate device slot: %w", err)
+	}
+
+	// Compatibility fallback for environments where migration 004 has not been applied yet.
+	var count int64
+	if err := tx.QueryRowContext(ctx, `select count(*) from devices`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("fallback device slot allocation: %w", err)
+	}
+
+	return count + 1, nil
+}
+
+func nextDeviceAddressesForSlot(slot int64) (string, string, error) {
+	if slot <= 0 {
+		return "", "", errors.New("invalid device slot")
+	}
+
+	third := (slot - 1) / 253
+	fourth := ((slot - 1) % 253) + 2
+
+	if third > 255 {
+		return "", "", errors.New("device address pool exhausted")
+	}
+
+	ipv4 := fmt.Sprintf("10.64.%d.%d/32", third, fourth)
+	ipv6 := fmt.Sprintf("fd00:%x::%x/128", third, fourth)
+	return ipv4, ipv6, nil
+}
+
+func shouldRetryDeviceAddressCollision(err error) bool {
+	pgErr, ok := asPgError(err)
+	if !ok || pgErr.Code != "23505" {
+		return false
+	}
+
+	constraint := strings.ToLower(strings.TrimSpace(pgErr.ConstraintName))
+	if strings.Contains(constraint, "ipv4") || strings.Contains(constraint, "ipv6") {
+		return true
+	}
+	return false
+}
+
+func asPgError(err error) (*pgconn.PgError, bool) {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr, true
+	}
+	return nil, false
+}
+
+func isSQLState(err error, sqlState string) bool {
+	pgErr, ok := asPgError(err)
+	if !ok {
+		return false
+	}
+	return pgErr.Code == sqlState
+}
+
+func generateAccountNumber() string {
+	// 16 uppercase chars gives us a compact account token for MVP UX.
+	return strings.ToUpper(strings.ReplaceAll(uuid.NewString(), "-", ""))[:16]
+}
+
+func locationFromRegion(region string) (city string, country string) {
+	parts := strings.Split(region, "-")
+	if len(parts) == 1 {
+		return strings.ToUpper(region), "Unknown"
+	}
+
+	country = strings.ToUpper(parts[0])
+	cityPart := parts[len(parts)-1]
+	if cityPart == "" {
+		cityPart = "unknown"
+	}
+
+	city = strings.ToUpper(cityPart[:1]) + cityPart[1:]
+	return city, country
+}
+
+func normalizeProvider(provider string) string {
+	value := strings.ToLower(strings.TrimSpace(provider))
+	switch value {
+	case "paddle":
+		return value
+	default:
+		return ""
+	}
+}
+
+func normalizeBillingStatus(status, eventType string) string {
+	value := strings.ToLower(strings.TrimSpace(status))
+	if value != "" && value != "unknown" {
+		return value
+	}
+
+	event := strings.ToLower(strings.TrimSpace(eventType))
+	switch {
+	case strings.Contains(event, "payment_failed"):
+		return "past_due"
+	case strings.Contains(event, "deleted"), strings.Contains(event, "canceled"), strings.Contains(event, "cancelled"):
+		return "canceled"
+	default:
+		return "active"
+	}
+}
+
+func accountStatusFromBillingStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "active", "trialing", "past_due":
+		return "active"
+	default:
+		return "suspended"
+	}
+}

@@ -1,0 +1,25 @@
+﻿app = "wg-gateway-pilot"
+primary_region = "lhr"
+
+[build]
+  image = "ghcr.io/example/wg-gateway-agent:latest"
+
+[env]
+  CONTROL_PLANE_BASE_URL = "https://control-plane.example.com"
+
+[[services]]
+  protocol = "udp"
+  internal_port = 51820
+
+  [[services.ports]]
+    port = 51820
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+
+  [[services.ports]]
+    port = 8080
+
+# NOTE:
+# Pilot only. Keep Fly route weight disabled until benchmark parity is validated.
