@@ -127,13 +127,18 @@ func (a *Agent) register(ctx context.Context) error {
 }
 
 func (a *Agent) heartbeat(ctx context.Context) error {
+	peerMetrics, peerErr := a.collectPeerRuntimeMetrics(ctx)
+	if peerErr != nil {
+		log.Printf("gateway-agent: failed to collect runtime peer metrics: %v", peerErr)
+	}
 	endpoint := fmt.Sprintf("/internal/gateways/%s/heartbeat", a.cfg.GatewayID)
 	payload := map[string]any{
 		"status": "healthy",
 		"metrics": map[string]any{
-			"apply_enabled":   a.cfg.GatewayWGApplyEnabled,
-			"applied_version": a.lastAppliedVersion,
+			"apply_enabled":    a.cfg.GatewayWGApplyEnabled,
+			"applied_version":  a.lastAppliedVersion,
 			"configured_peers": a.lastPeerCount,
+			"peers":            peerMetrics,
 		},
 	}
 	return a.postJSON(ctx, endpoint, payload)
@@ -455,6 +460,43 @@ func toStringSlice(value any) []string {
 	default:
 		return nil
 	}
+}
+
+func (a *Agent) collectPeerRuntimeMetrics(ctx context.Context) ([]map[string]any, error) {
+	output, err := a.runner.Run(ctx, "wg", "show", a.cfg.GatewayWGInterface, "dump")
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) <= 1 {
+		return []map[string]any{}, nil
+	}
+
+	peers := make([]map[string]any, 0, len(lines)-1)
+	for i := 1; i < len(lines); i++ {
+		parts := strings.Split(strings.TrimSpace(lines[i]), "\t")
+		if len(parts) < 8 {
+			continue
+		}
+
+		rxBytes, _ := strconv.ParseInt(strings.TrimSpace(parts[5]), 10, 64)
+		txBytes, _ := strconv.ParseInt(strings.TrimSpace(parts[6]), 10, 64)
+		latestHandshake, _ := strconv.ParseInt(strings.TrimSpace(parts[4]), 10, 64)
+		if latestHandshake < 0 {
+			latestHandshake = 0
+		}
+
+		peers = append(peers, map[string]any{
+			"public_key":       strings.TrimSpace(parts[0]),
+			"endpoint":         strings.TrimSpace(parts[2]),
+			"latest_handshake": latestHandshake,
+			"rx_bytes":         rxBytes,
+			"tx_bytes":         txBytes,
+		})
+	}
+
+	return peers, nil
 }
 
 func (a *Agent) postJSON(ctx context.Context, path string, body any) error {

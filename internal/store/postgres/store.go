@@ -488,6 +488,10 @@ values ($1::uuid, $2, $3::jsonb)
 		return fmt.Errorf("insert relay heartbeat: %w", err)
 	}
 
+	if err := s.updateDeviceRuntimeStatsFromMetrics(ctx, relayID, req.Metrics); err != nil {
+		return fmt.Errorf("update device runtime stats: %w", err)
+	}
+
 	return nil
 }
 
@@ -723,10 +727,32 @@ select
     a.status,
     a.expiry_at,
     a.updated_at,
-    count(d.id)::bigint as device_count
+    count(d.id)::bigint as device_count,
+    coalesce(sub.provider, 'paddle') as plan,
+    coalesce(sub.status, 'unpaid') as payment_status,
+    sub.current_period_end,
+    usage.last_seen_at,
+    coalesce(usage.rx_bytes_total, 0)::bigint,
+    coalesce(usage.tx_bytes_total, 0)::bigint
 from accounts a
 left join devices d on d.account_id = a.id
-group by a.id, a.account_number, a.supabase_user_id, a.status, a.expiry_at, a.updated_at
+left join lateral (
+    select s.provider, s.status, s.current_period_end
+    from subscriptions s
+    where s.account_id = a.id
+    order by s.updated_at desc
+    limit 1
+) sub on true
+left join lateral (
+    select
+        max(drs.last_handshake_at) as last_seen_at,
+        sum(drs.rx_bytes) as rx_bytes_total,
+        sum(drs.tx_bytes) as tx_bytes_total
+    from devices d2
+    left join device_runtime_stats drs on drs.device_id = d2.id
+    where d2.account_id = a.id
+) usage on true
+group by a.id, a.account_number, a.supabase_user_id, a.status, a.expiry_at, a.updated_at, sub.provider, sub.status, sub.current_period_end, usage.last_seen_at, usage.rx_bytes_total, usage.tx_bytes_total
 order by a.updated_at desc
 limit $1;
 `
@@ -739,7 +765,11 @@ limit $1;
 
 	out := make([]domain.AdminAccountSummary, 0)
 	for rows.Next() {
-		var item domain.AdminAccountSummary
+		var (
+			item             domain.AdminAccountSummary
+			currentPeriodEnd sql.NullTime
+			lastSeenAt       sql.NullTime
+		)
 		if err := rows.Scan(
 			&item.ID,
 			&item.AccountNumber,
@@ -748,8 +778,22 @@ limit $1;
 			&item.Expiry,
 			&item.UpdatedAt,
 			&item.DeviceCount,
+			&item.Plan,
+			&item.PaymentStatus,
+			&currentPeriodEnd,
+			&lastSeenAt,
+			&item.RxBytesTotal,
+			&item.TxBytesTotal,
 		); err != nil {
 			return nil, fmt.Errorf("admin scan account: %w", err)
+		}
+		if currentPeriodEnd.Valid {
+			t := currentPeriodEnd.Time.UTC()
+			item.CurrentPeriodEnd = &t
+		}
+		if lastSeenAt.Valid {
+			t := lastSeenAt.Time.UTC()
+			item.LastSeenAt = &t
 		}
 		out = append(out, item)
 	}
@@ -766,7 +810,7 @@ func (s *Store) AdminListGateways(ctx context.Context, limit int) ([]domain.Admi
 		limit = 200
 	}
 
-const query = `
+	const query = `
 select
     r.id::text,
     r.hostname,
@@ -780,10 +824,17 @@ select
     coalesce(h.status, 'unknown'),
     h.received_at,
     coalesce(a.result, 'n/a'),
-    a.created_at
+    a.created_at,
+    coalesce((h.metrics->>'configured_peers')::bigint, 0)::bigint,
+    coalesce((
+        select count(*)
+        from device_runtime_stats drs
+        where drs.relay_id = r.id
+          and drs.last_handshake_at > now() - interval '3 minutes'
+    ), 0)::bigint as connected_peers
 from relays r
 left join lateral (
-    select status, received_at
+    select status, received_at, metrics
     from relay_heartbeats rh
     where rh.relay_id = r.id
     order by rh.received_at desc
@@ -828,6 +879,8 @@ limit $1;
 			&lastHeartbeat,
 			&item.LastApply,
 			&lastApplyAt,
+			&item.ConfiguredPeers,
+			&item.ConnectedPeers,
 		); err != nil {
 			return nil, fmt.Errorf("admin scan gateway: %w", err)
 		}
@@ -867,9 +920,16 @@ select
     d.hijack_dns,
     d.created_at,
     d.ipv4_address::text,
-    d.ipv6_address::text
+    d.ipv6_address::text,
+    coalesce(r.hostname, ''),
+    drs.last_handshake_at,
+    coalesce(drs.rx_bytes, 0)::bigint,
+    coalesce(drs.tx_bytes, 0)::bigint,
+    coalesce(drs.last_handshake_at > now() - interval '3 minutes', false)
 from devices d
 join accounts a on a.id = d.account_id
+left join device_runtime_stats drs on drs.device_id = d.id
+left join relays r on r.id = drs.relay_id
 order by d.created_at desc
 limit $1;
 `
@@ -882,7 +942,10 @@ limit $1;
 
 	out := make([]domain.AdminDeviceSummary, 0)
 	for rows.Next() {
-		var item domain.AdminDeviceSummary
+		var (
+			item       domain.AdminDeviceSummary
+			lastSeenAt sql.NullTime
+		)
 		if err := rows.Scan(
 			&item.ID,
 			&item.AccountID,
@@ -894,8 +957,17 @@ limit $1;
 			&item.CreatedAt,
 			&item.IPv4Address,
 			&item.IPv6Address,
+			&item.RelayHostname,
+			&lastSeenAt,
+			&item.RxBytes,
+			&item.TxBytes,
+			&item.Connected,
 		); err != nil {
 			return nil, fmt.Errorf("admin scan device: %w", err)
+		}
+		if lastSeenAt.Valid {
+			t := lastSeenAt.Time.UTC()
+			item.LastSeenAt = &t
 		}
 		out = append(out, item)
 	}
@@ -925,14 +997,22 @@ select
     d.hijack_dns,
     d.created_at,
     d.ipv4_address::text,
-    d.ipv6_address::text
+    d.ipv6_address::text,
+    coalesce(r.hostname, ''),
+    drs.last_handshake_at,
+    coalesce(drs.rx_bytes, 0)::bigint,
+    coalesce(drs.tx_bytes, 0)::bigint,
+    coalesce(drs.last_handshake_at > now() - interval '3 minutes', false)
 from devices d
 join accounts a on a.id = d.account_id
+left join device_runtime_stats drs on drs.device_id = d.id
+left join relays r on r.id = drs.relay_id
 where a.account_number = $1 and d.id = $2::uuid
 limit 1;
 `
 
 	var item domain.AdminDeviceSummary
+	var lastSeenAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, query, accountNumber, deviceID).Scan(
 		&item.ID,
 		&item.AccountID,
@@ -944,12 +1024,21 @@ limit 1;
 		&item.CreatedAt,
 		&item.IPv4Address,
 		&item.IPv6Address,
+		&item.RelayHostname,
+		&lastSeenAt,
+		&item.RxBytes,
+		&item.TxBytes,
+		&item.Connected,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.AdminDeviceSummary{}, errNotFound
 	}
 	if err != nil {
 		return domain.AdminDeviceSummary{}, fmt.Errorf("admin get device by account number: %w", err)
+	}
+	if lastSeenAt.Valid {
+		t := lastSeenAt.Time.UTC()
+		item.LastSeenAt = &t
 	}
 
 	return item, nil
@@ -965,6 +1054,7 @@ func (s *Store) AdminReplaceDeviceKeyByAccountNumber(ctx context.Context, accoun
 	presharedKey = strings.TrimSpace(presharedKey)
 
 	const query = `
+with updated as (
 update devices d
 set
     pubkey = $3,
@@ -984,10 +1074,31 @@ returning
     d.hijack_dns,
     d.created_at,
     d.ipv4_address::text,
-    d.ipv6_address::text;
+    d.ipv6_address::text
+)
+select
+    u.id,
+    u.account_id,
+    u.account_number,
+    u.name,
+    u.pubkey,
+    u.preshared_key,
+    u.hijack_dns,
+    u.created_at,
+    u.ipv4_address,
+    u.ipv6_address,
+    coalesce(r.hostname, ''),
+    drs.last_handshake_at,
+    coalesce(drs.rx_bytes, 0)::bigint,
+    coalesce(drs.tx_bytes, 0)::bigint,
+    coalesce(drs.last_handshake_at > now() - interval '3 minutes', false)
+from updated u
+left join device_runtime_stats drs on drs.device_id::text = u.id
+left join relays r on r.id = drs.relay_id;
 `
 
 	var item domain.AdminDeviceSummary
+	var lastSeenAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, query, accountNumber, deviceID, pubkey, presharedKey).Scan(
 		&item.ID,
 		&item.AccountID,
@@ -999,6 +1110,11 @@ returning
 		&item.CreatedAt,
 		&item.IPv4Address,
 		&item.IPv6Address,
+		&item.RelayHostname,
+		&lastSeenAt,
+		&item.RxBytes,
+		&item.TxBytes,
+		&item.Connected,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.AdminDeviceSummary{}, errNotFound
@@ -1006,8 +1122,72 @@ returning
 	if err != nil {
 		return domain.AdminDeviceSummary{}, fmt.Errorf("admin replace device key by account number: %w", err)
 	}
+	if lastSeenAt.Valid {
+		t := lastSeenAt.Time.UTC()
+		item.LastSeenAt = &t
+	}
 
 	return item, nil
+}
+
+func (s *Store) updateDeviceRuntimeStatsFromMetrics(ctx context.Context, relayID string, metrics map[string]any) error {
+	if len(metrics) == 0 {
+		return nil
+	}
+
+	rawPeers, ok := metrics["peers"]
+	if !ok {
+		return nil
+	}
+
+	peerItems, ok := rawPeers.([]any)
+	if !ok {
+		return nil
+	}
+
+	const upsertQuery = `
+insert into device_runtime_stats (device_id, relay_id, endpoint, last_handshake_at, rx_bytes, tx_bytes, updated_at)
+values ($1::uuid, $2::uuid, nullif($3, ''), $4, $5, $6, now())
+on conflict (device_id) do update
+set
+    relay_id = excluded.relay_id,
+    endpoint = excluded.endpoint,
+    last_handshake_at = excluded.last_handshake_at,
+    rx_bytes = excluded.rx_bytes,
+    tx_bytes = excluded.tx_bytes,
+    updated_at = now();
+`
+
+	for _, item := range peerItems {
+		peerMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		publicKey := strings.TrimSpace(toMetricString(peerMap["public_key"]))
+		if publicKey == "" {
+			continue
+		}
+
+		var deviceID string
+		if err := s.db.QueryRowContext(ctx, `select id::text from devices where pubkey = $1`, publicKey).Scan(&deviceID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return fmt.Errorf("lookup device by public key: %w", err)
+		}
+
+		endpoint := strings.TrimSpace(toMetricString(peerMap["endpoint"]))
+		lastHandshake := toMetricTime(peerMap["latest_handshake"])
+		rxBytes := toMetricInt64(peerMap["rx_bytes"])
+		txBytes := toMetricInt64(peerMap["tx_bytes"])
+
+		if _, err := s.db.ExecContext(ctx, upsertQuery, deviceID, relayID, endpoint, lastHandshake, rxBytes, txBytes); err != nil {
+			return fmt.Errorf("upsert device runtime stats: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (s *Store) resolveAccountIDForBilling(ctx context.Context, tx *sql.Tx, provider string, event domain.BillingEvent) (string, error) {
@@ -1134,6 +1314,100 @@ func isSQLState(err error, sqlState string) bool {
 		return false
 	}
 	return pgErr.Code == sqlState
+}
+
+func toMetricString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case fmt.Stringer:
+		return typed.String()
+	default:
+		return ""
+	}
+}
+
+func toMetricInt64(value any) int64 {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed)
+	case int64:
+		return typed
+	case int32:
+		return int64(typed)
+	case float64:
+		return int64(typed)
+	case float32:
+		return int64(typed)
+	case json.Number:
+		if v, err := typed.Int64(); err == nil {
+			return v
+		}
+		if v, err := typed.Float64(); err == nil {
+			return int64(v)
+		}
+	case string:
+		v := strings.TrimSpace(typed)
+		if v == "" {
+			return 0
+		}
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return parsed
+		}
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+			return int64(parsed)
+		}
+	}
+	return 0
+}
+
+func toMetricTime(value any) any {
+	switch typed := value.(type) {
+	case time.Time:
+		t := typed.UTC()
+		return t
+	case float64:
+		if typed <= 0 {
+			return nil
+		}
+		t := time.Unix(int64(typed), 0).UTC()
+		return t
+	case int64:
+		if typed <= 0 {
+			return nil
+		}
+		t := time.Unix(typed, 0).UTC()
+		return t
+	case int:
+		if typed <= 0 {
+			return nil
+		}
+		t := time.Unix(int64(typed), 0).UTC()
+		return t
+	case json.Number:
+		if v, err := typed.Int64(); err == nil && v > 0 {
+			t := time.Unix(v, 0).UTC()
+			return t
+		}
+		if v, err := typed.Float64(); err == nil && v > 0 {
+			t := time.Unix(int64(v), 0).UTC()
+			return t
+		}
+	case string:
+		v := strings.TrimSpace(typed)
+		if v == "" {
+			return nil
+		}
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
+			t := time.Unix(parsed, 0).UTC()
+			return t
+		}
+		if parsed, err := time.Parse(time.RFC3339, v); err == nil {
+			t := parsed.UTC()
+			return t
+		}
+	}
+	return nil
 }
 
 func generateAccountNumber() string {

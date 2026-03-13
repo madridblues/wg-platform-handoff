@@ -46,46 +46,63 @@ type adminSessionManager struct {
 }
 
 type adminDashboardView struct {
-	GeneratedAt      string
-	TotalAccounts    int
-	TotalDevices     int
-	TotalGateways    int
-	HealthyGateways  int
-	Accounts         []adminAccountRow
-	Gateways         []adminGatewayRow
-	Devices          []adminDeviceRow
+	GeneratedAt         string
+	TotalAccounts       int
+	TotalDevices        int
+	TotalGateways       int
+	HealthyGateways     int
+	ActiveConnections   int
+	PaidAccounts        int
+	ObservedTraffic     string
+	GatewayUtilization  string
+	Accounts            []adminAccountRow
+	Gateways            []adminGatewayRow
+	Devices             []adminDeviceRow
 }
 
 type adminAccountRow struct {
-	AccountNumber  string
-	SupabaseUserID string
-	Status         string
-	Expiry         string
-	DeviceCount    int64
-	UpdatedAt      string
+	AccountNumber     string
+	SupabaseUserID    string
+	Status            string
+	PaymentStatus     string
+	Plan              string
+	Expiry            string
+	CurrentPeriodEnd  string
+	DeviceCount       int64
+	LastSeen          string
+	BandwidthUsed     string
+	UpdatedAt         string
 }
 
 type adminGatewayRow struct {
-	Hostname      string
-	Region        string
-	Provider      string
-	WGPort        int
-	Active        string
-	PublicIPv4    string
-	PublicIPv6    string
-	LastStatus    string
-	LastHeartbeat string
-	LastApply     string
+	Hostname          string
+	Region            string
+	Provider          string
+	WGPort            int
+	Active            string
+	PublicIPv4        string
+	PublicIPv6        string
+	LastStatus        string
+	LastStatusClass   string
+	LastHeartbeat     string
+	LastHeartbeatRel  string
+	LastApply         string
+	Load              string
 }
 
 type adminDeviceRow struct {
-	AccountNumber string
-	DeviceID      string
-	DeviceName    string
-	IPv4Address   string
-	CreatedAt     string
-	DownloadURL   string
-	QRURL         string
+	AccountNumber  string
+	DeviceID       string
+	DeviceName     string
+	IPv4Address    string
+	RelayHostname  string
+	LastSeen       string
+	BandwidthUsed  string
+	ConnectionText string
+	ConnectionClass string
+	CreatedAt      string
+	DownloadURL    string
+	QRURL          string
 }
 
 var adminLoginTemplate = template.Must(template.New("admin-login").Parse(`<!doctype html>
@@ -134,9 +151,20 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
     .card { border: 1px solid #ddd; border-radius: 8px; padding: 0.7rem; background: #fafafa; }
     .label { font-size: 12px; color: #666; }
     .value { font-size: 22px; font-weight: 700; margin-top: 0.2rem; }
+    .status { display: inline-flex; align-items: center; gap: 0.35rem; }
+    .dot { width: 8px; height: 8px; border-radius: 9999px; display: inline-block; }
+    .status-ok { background: #2e7d32; }
+    .status-bad { background: #b71c1c; }
+    .status-unknown { background: #757575; }
     .wg-form { display: flex; gap: 0.35rem; align-items: center; flex-wrap: wrap; }
     .wg-form input { min-width: 220px; padding: 0.35rem; }
     .hint { font-size: 12px; color: #666; }
+    @media (max-width: 1100px) {
+      .cards { grid-template-columns: repeat(2, minmax(0,1fr)); }
+    }
+    @media (max-width: 700px) {
+      .cards { grid-template-columns: repeat(1, minmax(0,1fr)); }
+    }
   </style>
   <meta http-equiv="refresh" content="20"/>
 </head>
@@ -151,6 +179,10 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
     <div class="card"><div class="label">Devices</div><div class="value">{{.TotalDevices}}</div></div>
     <div class="card"><div class="label">Gateways</div><div class="value">{{.TotalGateways}}</div></div>
     <div class="card"><div class="label">Healthy Gateways</div><div class="value">{{.HealthyGateways}}</div></div>
+    <div class="card"><div class="label">Active Connections</div><div class="value">{{.ActiveConnections}}</div></div>
+    <div class="card"><div class="label">Paid Accounts</div><div class="value">{{.PaidAccounts}}</div></div>
+    <div class="card"><div class="label">Observed Traffic</div><div class="value">{{.ObservedTraffic}}</div></div>
+    <div class="card"><div class="label">Gateway Utilization</div><div class="value">{{.GatewayUtilization}}</div></div>
   </div>
 
   <div class="section">
@@ -159,14 +191,18 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
       <thead>
         <tr>
           <th>Hostname</th><th>Region</th><th>Provider</th><th>Port</th><th>Active</th>
-          <th>Public IPv4</th><th>Status</th><th>Last Heartbeat</th><th>Last Apply</th>
+          <th>Public IPv4</th><th>Status</th><th>Load</th><th>Last Heartbeat</th><th>Last Apply</th>
         </tr>
       </thead>
       <tbody>
         {{range .Gateways}}
         <tr>
           <td>{{.Hostname}}</td><td>{{.Region}}</td><td>{{.Provider}}</td><td>{{.WGPort}}</td><td>{{.Active}}</td>
-          <td>{{.PublicIPv4}}</td><td>{{.LastStatus}}</td><td>{{.LastHeartbeat}}</td><td>{{.LastApply}}</td>
+          <td>{{.PublicIPv4}}</td>
+          <td><span class="status"><span class="dot {{.LastStatusClass}}"></span>{{.LastStatus}}</span></td>
+          <td>{{.Load}}</td>
+          <td>{{.LastHeartbeatRel}}<div class="hint">{{.LastHeartbeat}}</div></td>
+          <td>{{.LastApply}}</td>
         </tr>
         {{end}}
       </tbody>
@@ -178,15 +214,16 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
     <table>
       <thead>
         <tr>
-          <th>Account Number</th><th>Supabase User</th><th>Status</th>
-          <th>Expiry</th><th>Devices</th><th>Updated</th>
+          <th>Account Number</th><th>Supabase User</th><th>Status</th><th>Payment</th><th>Plan</th>
+          <th>Expiry</th><th>Period End</th><th>Devices</th><th>Last Connected</th><th>Bandwidth</th><th>Updated</th>
         </tr>
       </thead>
       <tbody>
         {{range .Accounts}}
         <tr>
           <td>{{.AccountNumber}}</td><td>{{.SupabaseUserID}}</td><td>{{.Status}}</td>
-          <td>{{.Expiry}}</td><td>{{.DeviceCount}}</td><td>{{.UpdatedAt}}</td>
+          <td>{{.PaymentStatus}}</td><td>{{.Plan}}</td><td>{{.Expiry}}</td><td>{{.CurrentPeriodEnd}}</td><td>{{.DeviceCount}}</td>
+          <td>{{.LastSeen}}</td><td>{{.BandwidthUsed}}</td><td>{{.UpdatedAt}}</td>
         </tr>
         {{end}}
       </tbody>
@@ -197,13 +234,14 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
     <table>
       <thead>
         <tr>
-          <th>Account</th><th>Device ID</th><th>Name</th><th>IPv4</th><th>Created</th><th>WireGuard Config</th>
+          <th>Account</th><th>Device ID</th><th>Name</th><th>IPv4</th><th>Gateway</th><th>Last Seen</th><th>Bandwidth</th><th>Status</th><th>Created</th><th>WireGuard Config</th>
         </tr>
       </thead>
       <tbody>
         {{range .Devices}}
         <tr>
-          <td>{{.AccountNumber}}</td><td>{{.DeviceID}}</td><td>{{.DeviceName}}</td><td>{{.IPv4Address}}</td><td>{{.CreatedAt}}</td>
+          <td>{{.AccountNumber}}</td><td>{{.DeviceID}}</td><td>{{.DeviceName}}</td><td>{{.IPv4Address}}</td><td>{{.RelayHostname}}</td><td>{{.LastSeen}}</td><td>{{.BandwidthUsed}}</td>
+          <td><span class="status"><span class="dot {{.ConnectionClass}}"></span>{{.ConnectionText}}</span></td><td>{{.CreatedAt}}</td>
           <td>
             <form class="wg-form" method="get" action="{{.DownloadURL}}">
               <input id="pk-{{.DeviceID}}" type="text" name="private_key" placeholder="Client private key (base64)" required />
@@ -342,14 +380,18 @@ func (h *AdminHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := adminDashboardView{
-		GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
-		TotalAccounts:   len(accounts),
-		TotalDevices:    len(devices),
-		TotalGateways:   len(gateways),
-		HealthyGateways: countHealthyGateways(gateways),
-		Accounts:        toAdminAccountRows(accounts),
-		Gateways:        toAdminGatewayRows(gateways),
-		Devices:         toAdminDeviceRows(devices),
+		GeneratedAt:        time.Now().UTC().Format(time.RFC3339),
+		TotalAccounts:      len(accounts),
+		TotalDevices:       len(devices),
+		TotalGateways:      len(gateways),
+		HealthyGateways:    countHealthyGateways(gateways),
+		ActiveConnections:  countConnectedDevices(devices),
+		PaidAccounts:       countPaidAccounts(accounts),
+		ObservedTraffic:    formatBytes(totalTrafficBytes(accounts)),
+		GatewayUtilization: summarizeGatewayUtilization(gateways),
+		Accounts:           toAdminAccountRows(accounts),
+		Gateways:           toAdminGatewayRows(gateways),
+		Devices:            toAdminDeviceRows(devices),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -746,13 +788,26 @@ func wireGuardPublicKeyFromPrivate(privateKey string) (string, error) {
 func toAdminAccountRows(items []domain.AdminAccountSummary) []adminAccountRow {
 	out := make([]adminAccountRow, 0, len(items))
 	for _, item := range items {
+		periodEnd := "n/a"
+		if item.CurrentPeriodEnd != nil {
+			periodEnd = formatTS(*item.CurrentPeriodEnd)
+		}
+		lastSeen := "never"
+		if item.LastSeenAt != nil {
+			lastSeen = relativeTime(*item.LastSeenAt)
+		}
 		out = append(out, adminAccountRow{
-			AccountNumber:  item.AccountNumber,
-			SupabaseUserID: item.SupabaseUserID,
-			Status:         item.Status,
-			Expiry:         formatTS(item.Expiry),
-			DeviceCount:    item.DeviceCount,
-			UpdatedAt:      formatTS(item.UpdatedAt),
+			AccountNumber:    item.AccountNumber,
+			SupabaseUserID:   item.SupabaseUserID,
+			Status:           item.Status,
+			PaymentStatus:    item.PaymentStatus,
+			Plan:             item.Plan,
+			Expiry:           formatTS(item.Expiry),
+			CurrentPeriodEnd: periodEnd,
+			DeviceCount:      item.DeviceCount,
+			LastSeen:         lastSeen,
+			BandwidthUsed:    formatBytes(item.RxBytesTotal + item.TxBytesTotal),
+			UpdatedAt:        formatTS(item.UpdatedAt),
 		})
 	}
 	return out
@@ -772,18 +827,40 @@ func toAdminGatewayRows(items []domain.AdminGatewaySummary) []adminGatewayRow {
 		if item.LastApplyAt != nil {
 			lastApply = lastApply + " @ " + formatTS(*item.LastApplyAt)
 		}
+		statusClass := "status-unknown"
+		status := strings.ToLower(strings.TrimSpace(item.LastStatus))
+		if status == "healthy" || status == "ok" {
+			statusClass = "status-ok"
+		}
+		if status == "failed" || status == "error" || status == "degraded" {
+			statusClass = "status-bad"
+		}
+		heartbeatRelative := "never"
+		if item.LastHeartbeat != nil {
+			heartbeatRelative = relativeTime(*item.LastHeartbeat)
+		}
+		load := "n/a"
+		if item.ConfiguredPeers > 0 {
+			percent := int((float64(item.ConnectedPeers) / float64(item.ConfiguredPeers)) * 100)
+			load = fmt.Sprintf("%d/%d (%d%%)", item.ConnectedPeers, item.ConfiguredPeers, percent)
+		} else if item.ConnectedPeers > 0 {
+			load = fmt.Sprintf("%d connected", item.ConnectedPeers)
+		}
 
 		out = append(out, adminGatewayRow{
-			Hostname:      item.Hostname,
-			Region:        item.Region,
-			Provider:      item.Provider,
-			WGPort:        item.WGPort,
-			Active:        fmt.Sprintf("%t", item.Active),
-			PublicIPv4:    item.PublicIPv4,
-			PublicIPv6:    item.PublicIPv6,
-			LastStatus:    item.LastStatus,
-			LastHeartbeat: heartbeat,
-			LastApply:     lastApply,
+			Hostname:         item.Hostname,
+			Region:           item.Region,
+			Provider:         item.Provider,
+			WGPort:           item.WGPort,
+			Active:           fmt.Sprintf("%t", item.Active),
+			PublicIPv4:       item.PublicIPv4,
+			PublicIPv6:       item.PublicIPv6,
+			LastStatus:       item.LastStatus,
+			LastStatusClass:  statusClass,
+			LastHeartbeat:    heartbeat,
+			LastHeartbeatRel: heartbeatRelative,
+			LastApply:        lastApply,
+			Load:             load,
 		})
 	}
 	return out
@@ -792,14 +869,33 @@ func toAdminGatewayRows(items []domain.AdminGatewaySummary) []adminGatewayRow {
 func toAdminDeviceRows(items []domain.AdminDeviceSummary) []adminDeviceRow {
 	out := make([]adminDeviceRow, 0, len(items))
 	for _, item := range items {
+		lastSeen := "never"
+		if item.LastSeenAt != nil {
+			lastSeen = relativeTime(*item.LastSeenAt)
+		}
+		connectionText := "offline"
+		connectionClass := "status-bad"
+		if item.Connected {
+			connectionText = "connected"
+			connectionClass = "status-ok"
+		}
+		relay := strings.TrimSpace(item.RelayHostname)
+		if relay == "" {
+			relay = "n/a"
+		}
 		out = append(out, adminDeviceRow{
-			AccountNumber: item.AccountNumber,
-			DeviceID:      item.ID,
-			DeviceName:    item.Name,
-			IPv4Address:   item.IPv4Address,
-			CreatedAt:     formatTS(item.CreatedAt),
-			DownloadURL:   fmt.Sprintf("/admin/wireguard-config/%s/%s", item.AccountNumber, item.ID),
-			QRURL:         fmt.Sprintf("/admin/wireguard-qr/%s/%s", item.AccountNumber, item.ID),
+			AccountNumber:   item.AccountNumber,
+			DeviceID:        item.ID,
+			DeviceName:      item.Name,
+			IPv4Address:     item.IPv4Address,
+			RelayHostname:   relay,
+			LastSeen:        lastSeen,
+			BandwidthUsed:   formatBytes(item.RxBytes + item.TxBytes),
+			ConnectionText:  connectionText,
+			ConnectionClass: connectionClass,
+			CreatedAt:       formatTS(item.CreatedAt),
+			DownloadURL:     fmt.Sprintf("/admin/wireguard-config/%s/%s", item.AccountNumber, item.ID),
+			QRURL:           fmt.Sprintf("/admin/wireguard-qr/%s/%s", item.AccountNumber, item.ID),
 		})
 	}
 	return out
@@ -824,4 +920,87 @@ func formatTS(t time.Time) string {
 		return "n/a"
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+func relativeTime(t time.Time) string {
+	if t.IsZero() {
+		return "n/a"
+	}
+	delta := time.Since(t.UTC())
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta < time.Minute {
+		return "just now"
+	}
+	if delta < time.Hour {
+		return fmt.Sprintf("%dm ago", int(delta.Minutes()))
+	}
+	if delta < 24*time.Hour {
+		return fmt.Sprintf("%dh ago", int(delta.Hours()))
+	}
+	return fmt.Sprintf("%dd ago", int(delta.Hours()/24))
+}
+
+func formatBytes(n int64) string {
+	if n <= 0 {
+		return "0 B"
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	value := float64(n)
+	unit := 0
+	for value >= 1024 && unit < len(units)-1 {
+		value = value / 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d %s", int64(value), units[unit])
+	}
+	return fmt.Sprintf("%.1f %s", value, units[unit])
+}
+
+func countConnectedDevices(items []domain.AdminDeviceSummary) int {
+	total := 0
+	for _, item := range items {
+		if item.Connected {
+			total++
+		}
+	}
+	return total
+}
+
+func countPaidAccounts(items []domain.AdminAccountSummary) int {
+	total := 0
+	for _, item := range items {
+		status := strings.ToLower(strings.TrimSpace(item.PaymentStatus))
+		if status == "active" || status == "trialing" || status == "past_due" {
+			total++
+		}
+	}
+	return total
+}
+
+func totalTrafficBytes(items []domain.AdminAccountSummary) int64 {
+	var total int64
+	for _, item := range items {
+		total += item.RxBytesTotal + item.TxBytesTotal
+	}
+	return total
+}
+
+func summarizeGatewayUtilization(items []domain.AdminGatewaySummary) string {
+	var configured int64
+	var connected int64
+	for _, item := range items {
+		configured += item.ConfiguredPeers
+		connected += item.ConnectedPeers
+	}
+	if configured <= 0 {
+		if connected <= 0 {
+			return "n/a"
+		}
+		return fmt.Sprintf("%d connected", connected)
+	}
+	percent := int((float64(connected) / float64(configured)) * 100)
+	return fmt.Sprintf("%d/%d (%d%%)", connected, configured, percent)
 }

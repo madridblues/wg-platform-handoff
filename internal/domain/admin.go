@@ -10,6 +10,12 @@ type AdminAccountSummary struct {
 	Expiry         time.Time
 	UpdatedAt      time.Time
 	DeviceCount    int64
+	Plan           string
+	PaymentStatus  string
+	CurrentPeriodEnd *time.Time
+	LastSeenAt     *time.Time
+	RxBytesTotal   int64
+	TxBytesTotal   int64
 }
 
 type AdminGatewaySummary struct {
@@ -26,6 +32,8 @@ type AdminGatewaySummary struct {
 	LastHeartbeat *time.Time
 	LastApply     string
 	LastApplyAt   *time.Time
+	ConfiguredPeers int64
+	ConnectedPeers  int64
 }
 
 type AdminDeviceSummary struct {
@@ -39,4 +47,9 @@ type AdminDeviceSummary struct {
 	CreatedAt     time.Time
 	IPv4Address   string
 	IPv6Address   string
+	RelayHostname string
+	LastSeenAt    *time.Time
+	RxBytes       int64
+	TxBytes       int64
+	Connected     bool
 }
