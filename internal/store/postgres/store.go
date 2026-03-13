@@ -488,7 +488,7 @@ values ($1::uuid, $2, $3::jsonb)
 		return fmt.Errorf("insert relay heartbeat: %w", err)
 	}
 
-	if err := s.updateDeviceRuntimeStatsFromJSON(ctx, relayID, metrics); err != nil {
+	if err := s.updateDeviceRuntimeStatsFromJSON(ctx, relayID, string(metrics)); err != nil {
 		return fmt.Errorf("update device runtime stats: %w", err)
 	}
 
@@ -1130,7 +1130,7 @@ left join relays r on r.id = drs.relay_id;
 	return item, nil
 }
 
-func (s *Store) updateDeviceRuntimeStatsFromJSON(ctx context.Context, relayID string, metricsJSON []byte) error {
+func (s *Store) updateDeviceRuntimeStatsFromJSON(ctx context.Context, relayID string, metricsJSON string) error {
 	if len(metricsJSON) == 0 {
 		return nil
 	}
