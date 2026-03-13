@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -69,7 +70,7 @@ func TestDownloadWireGuardConfig(t *testing.T) {
 	store.devices = append(store.devices, domain.Device{
 		ID:          "dev-1",
 		Name:        "device-1",
-		PubKey:      "test-pubkey",
+		PubKey:      "ATOulp3th4vUrMoDc+MJ92SphcBSxmwnUQ0ChTcbVEU=",
 		HijackDNS:   false,
 		Created:     time.Now().UTC(),
 		IPv4Address: "10.64.0.2/32",
@@ -121,7 +122,7 @@ func TestDownloadWireGuardQRCode(t *testing.T) {
 	store.devices = append(store.devices, domain.Device{
 		ID:          "dev-1",
 		Name:        "device-1",
-		PubKey:      "test-pubkey",
+		PubKey:      "ATOulp3th4vUrMoDc+MJ92SphcBSxmwnUQ0ChTcbVEU=",
 		HijackDNS:   false,
 		Created:     time.Now().UTC(),
 		IPv4Address: "10.64.0.2/32",
@@ -165,5 +166,58 @@ func TestDownloadWireGuardQRCode(t *testing.T) {
 	}
 	if body := res.Body.Bytes(); len(body) < 8 || string(body[:8]) != "\x89PNG\r\n\x1a\n" {
 		t.Fatalf("expected PNG body")
+	}
+}
+
+func TestGenerateAndSyncWireGuardKey(t *testing.T) {
+	store := newFakeStore()
+	store.devices = append(store.devices, domain.Device{
+		ID:          "dev-1",
+		Name:        "device-1",
+		PubKey:      "old-pubkey",
+		HijackDNS:   false,
+		Created:     time.Now().UTC(),
+		IPv4Address: "10.64.0.2/32",
+		IPv6Address: "fd00::2/128",
+	})
+	admin := NewAdminHandler(store, "topsecret", "session-secret", 1*time.Hour)
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/admin/login", strings.NewReader("password=topsecret"))
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRes := httptest.NewRecorder()
+	admin.LoginSubmit(loginRes, loginReq)
+
+	var sessionCookie *http.Cookie
+	for _, cookie := range loginRes.Result().Cookies() {
+		if cookie.Name == adminSessionCookieName {
+			sessionCookie = cookie
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatalf("expected admin session cookie")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/wireguard-key/ACC0001/dev-1/generate", nil)
+	req = req.WithContext(context.Background())
+	req.SetPathValue("account", "ACC0001")
+	req.SetPathValue("device", "dev-1")
+	req.AddCookie(sessionCookie)
+
+	res := httptest.NewRecorder()
+	admin.GenerateAndSyncWireGuardKey(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
+	}
+
+	var payload map[string]string
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode json: %v", err)
+	}
+	if payload["private_key"] == "" || payload["public_key"] == "" {
+		t.Fatalf("expected generated keypair payload")
+	}
+	if store.devices[0].PubKey != payload["public_key"] {
+		t.Fatalf("expected device pubkey to be synced")
 	}
 }

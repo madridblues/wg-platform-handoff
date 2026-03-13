@@ -922,6 +922,57 @@ limit 1;
 	return item, nil
 }
 
+func (s *Store) AdminReplaceDeviceKeyByAccountNumber(ctx context.Context, accountNumber, deviceID, pubkey string) (domain.AdminDeviceSummary, error) {
+	accountNumber = strings.TrimSpace(accountNumber)
+	deviceID = strings.TrimSpace(deviceID)
+	pubkey = strings.TrimSpace(pubkey)
+	if accountNumber == "" || deviceID == "" || pubkey == "" {
+		return domain.AdminDeviceSummary{}, errors.New("account number, device id, and pubkey are required")
+	}
+
+	const query = `
+update devices d
+set
+    pubkey = $3,
+    updated_at = now()
+from accounts a
+where d.account_id = a.id
+  and a.account_number = $1
+  and d.id = $2::uuid
+returning
+    d.id::text,
+    d.account_id::text,
+    a.account_number,
+    d.name,
+    d.pubkey,
+    d.hijack_dns,
+    d.created_at,
+    d.ipv4_address::text,
+    d.ipv6_address::text;
+`
+
+	var item domain.AdminDeviceSummary
+	err := s.db.QueryRowContext(ctx, query, accountNumber, deviceID, pubkey).Scan(
+		&item.ID,
+		&item.AccountID,
+		&item.AccountNumber,
+		&item.Name,
+		&item.PubKey,
+		&item.HijackDNS,
+		&item.CreatedAt,
+		&item.IPv4Address,
+		&item.IPv6Address,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.AdminDeviceSummary{}, errNotFound
+	}
+	if err != nil {
+		return domain.AdminDeviceSummary{}, fmt.Errorf("admin replace device key by account number: %w", err)
+	}
+
+	return item, nil
+}
+
 func (s *Store) resolveAccountIDForBilling(ctx context.Context, tx *sql.Tx, provider string, event domain.BillingEvent) (string, error) {
 	if accountNumber := strings.TrimSpace(event.AccountNumber); accountNumber != "" {
 		var accountID string

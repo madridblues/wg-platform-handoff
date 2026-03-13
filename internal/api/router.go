@@ -55,6 +55,7 @@ func NewRouterWithDeps(
 	mux.HandleFunc("GET /admin", admin.Dashboard)
 	mux.HandleFunc("GET /admin/wireguard-config/{account}/{device}", admin.DownloadWireGuardConfig)
 	mux.HandleFunc("GET /admin/wireguard-qr/{account}/{device}", admin.DownloadWireGuardQRCode)
+	mux.HandleFunc("POST /admin/wireguard-key/{account}/{device}/generate", admin.GenerateAndSyncWireGuardKey)
 	mux.HandleFunc("POST /admin/logout", admin.Logout)
 
 	// Public compatibility API

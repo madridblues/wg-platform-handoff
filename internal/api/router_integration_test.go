@@ -211,6 +211,30 @@ func (s *fakeStore) AdminGetDeviceByAccountNumber(_ context.Context, accountNumb
 	return domain.AdminDeviceSummary{}, errors.New("not found")
 }
 
+func (s *fakeStore) AdminReplaceDeviceKeyByAccountNumber(_ context.Context, accountNumber, deviceID, pubkey string) (domain.AdminDeviceSummary, error) {
+	if !strings.EqualFold(strings.TrimSpace(accountNumber), s.account.Number) {
+		return domain.AdminDeviceSummary{}, errors.New("not found")
+	}
+	for i, d := range s.devices {
+		if d.ID == deviceID {
+			d.PubKey = pubkey
+			s.devices[i] = d
+			return domain.AdminDeviceSummary{
+				ID:            d.ID,
+				AccountID:     s.account.ID,
+				AccountNumber: s.account.Number,
+				Name:          d.Name,
+				PubKey:        d.PubKey,
+				HijackDNS:     d.HijackDNS,
+				CreatedAt:     d.Created,
+				IPv4Address:   d.IPv4Address,
+				IPv6Address:   d.IPv6Address,
+			}, nil
+		}
+	}
+	return domain.AdminDeviceSummary{}, errors.New("not found")
+}
+
 func buildTestRouter(gatewayToken string) http.Handler {
 	cfg := config.Config{
 		GatewayToken:      gatewayToken,

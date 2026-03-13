@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/skip2/go-qrcode"
+	"golang.org/x/crypto/curve25519"
 	"wg-platform-handoff/internal/domain"
 	"wg-platform-handoff/internal/store"
 )
@@ -28,6 +31,7 @@ type adminReadableStore interface {
 	AdminListGateways(ctx context.Context, limit int) ([]domain.AdminGatewaySummary, error)
 	AdminListDevices(ctx context.Context, limit int) ([]domain.AdminDeviceSummary, error)
 	AdminGetDeviceByAccountNumber(ctx context.Context, accountNumber, deviceID string) (domain.AdminDeviceSummary, error)
+	AdminReplaceDeviceKeyByAccountNumber(ctx context.Context, accountNumber, deviceID, pubkey string) (domain.AdminDeviceSummary, error)
 }
 
 type AdminHandler struct {
@@ -130,6 +134,7 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
     .value { font-size: 22px; font-weight: 700; margin-top: 0.2rem; }
     .wg-form { display: flex; gap: 0.35rem; align-items: center; flex-wrap: wrap; }
     .wg-form input { min-width: 220px; padding: 0.35rem; }
+    .hint { font-size: 12px; color: #666; }
   </style>
   <meta http-equiv="refresh" content="20"/>
 </head>
@@ -199,16 +204,38 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
           <td>{{.AccountNumber}}</td><td>{{.DeviceID}}</td><td>{{.DeviceName}}</td><td>{{.IPv4Address}}</td><td>{{.CreatedAt}}</td>
           <td>
             <form class="wg-form" method="get" action="{{.DownloadURL}}">
-              <input type="text" name="private_key" placeholder="Client private key (base64)" required />
+              <input id="pk-{{.DeviceID}}" type="text" name="private_key" placeholder="Client private key (base64)" required />
+              <button type="button" onclick="generateKey('{{.AccountNumber}}','{{.DeviceID}}')">Generate key</button>
               <button type="submit">Download</button>
               <button type="submit" formaction="{{.QRURL}}" formtarget="_blank">QR</button>
             </form>
+            <div id="msg-{{.DeviceID}}" class="hint"></div>
           </td>
         </tr>
         {{end}}
       </tbody>
     </table>
   </div>
+  <script>
+    async function generateKey(account, device) {
+      const msg = document.getElementById(`msg-${device}`);
+      const input = document.getElementById(`pk-${device}`);
+      if (!msg || !input) return;
+      msg.textContent = 'Generating key...';
+      try {
+        const res = await fetch(`/admin/wireguard-key/${encodeURIComponent(account)}/${encodeURIComponent(device)}/generate`, { method: 'POST' });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || `HTTP ${res.status}`);
+        }
+        const payload = await res.json();
+        input.value = payload.private_key || '';
+        msg.textContent = 'Key generated and synced to device.';
+      } catch (err) {
+        msg.textContent = `Key generation failed: ${err.message}`;
+      }
+    }
+  </script>
 </body>
 </html>`))
 
@@ -405,6 +432,49 @@ func (h *AdminHandler) DownloadWireGuardQRCode(w http.ResponseWriter, r *http.Re
 	_, _ = w.Write(png)
 }
 
+func (h *AdminHandler) GenerateAndSyncWireGuardKey(w http.ResponseWriter, r *http.Request) {
+	if !h.enabled() {
+		http.Error(w, "admin dashboard disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if !h.isAuthenticated(r) {
+		http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
+		return
+	}
+	backend, ok := h.store.(adminReadableStore)
+	if !ok {
+		http.Error(w, "admin backend unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	accountNumber := strings.TrimSpace(r.PathValue("account"))
+	deviceID := strings.TrimSpace(r.PathValue("device"))
+	if accountNumber == "" || deviceID == "" {
+		http.Error(w, "missing account/device path params", http.StatusBadRequest)
+		return
+	}
+
+	privateKey, publicKey, err := generateWireGuardKeypair()
+	if err != nil {
+		http.Error(w, "failed to generate keypair", http.StatusInternalServerError)
+		return
+	}
+
+	device, err := backend.AdminReplaceDeviceKeyByAccountNumber(r.Context(), accountNumber, deviceID, publicKey)
+	if err != nil {
+		http.Error(w, "failed to sync device key", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"account_number": device.AccountNumber,
+		"device_id":      device.ID,
+		"public_key":     publicKey,
+		"private_key":    privateKey,
+	})
+}
+
 func (h *AdminHandler) buildWireGuardConfig(ctx context.Context, backend adminReadableStore, accountPathValue, devicePathValue, privateKeyRaw string) (domain.AdminDeviceSummary, string, error) {
 	accountNumber := strings.TrimSpace(accountPathValue)
 	deviceID := strings.TrimSpace(devicePathValue)
@@ -419,6 +489,13 @@ func (h *AdminHandler) buildWireGuardConfig(ctx context.Context, backend adminRe
 	device, err := backend.AdminGetDeviceByAccountNumber(ctx, accountNumber, deviceID)
 	if err != nil {
 		return domain.AdminDeviceSummary{}, "", fmt.Errorf("device not found")
+	}
+	derivedPublicKey, err := wireGuardPublicKeyFromPrivate(privateKey)
+	if err != nil {
+		return domain.AdminDeviceSummary{}, "", fmt.Errorf("invalid private_key")
+	}
+	if strings.TrimSpace(device.PubKey) != "" && strings.TrimSpace(device.PubKey) != derivedPublicKey {
+		return domain.AdminDeviceSummary{}, "", fmt.Errorf("private_key does not match device public key; click Generate key to sync")
 	}
 
 	gateways, err := backend.AdminListGateways(ctx, 200)
@@ -574,6 +651,41 @@ func looksLikeWireGuardPrivateKey(value string) bool {
 		return false
 	}
 	return len(decoded) == 32
+}
+
+func generateWireGuardKeypair() (string, string, error) {
+	var priv [32]byte
+	if _, err := rand.Read(priv[:]); err != nil {
+		return "", "", err
+	}
+	// Clamp as required by X25519 private keys.
+	priv[0] &= 248
+	priv[31] = (priv[31] & 127) | 64
+
+	pubBytes, err := curve25519.X25519(priv[:], curve25519.Basepoint)
+	if err != nil {
+		return "", "", err
+	}
+
+	privateKey := base64.StdEncoding.EncodeToString(priv[:])
+	publicKey := base64.StdEncoding.EncodeToString(pubBytes)
+	return privateKey, publicKey, nil
+}
+
+func wireGuardPublicKeyFromPrivate(privateKey string) (string, error) {
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(privateKey))
+	if err != nil {
+		return "", err
+	}
+	if len(decoded) != 32 {
+		return "", fmt.Errorf("invalid private key length")
+	}
+
+	pubBytes, err := curve25519.X25519(decoded, curve25519.Basepoint)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(pubBytes), nil
 }
 
 func toAdminAccountRows(items []domain.AdminAccountSummary) []adminAccountRow {
