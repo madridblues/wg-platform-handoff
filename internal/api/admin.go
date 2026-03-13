@@ -383,9 +383,9 @@ func (h *AdminHandler) DownloadWireGuardConfig(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	filename := fmt.Sprintf("%s-%s.conf", sanitizeFilename(device.AccountNumber), sanitizeFilename(device.ID))
+	filename := wireGuardFilename(device.AccountNumber, device.ID)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", filename, filename))
 	_, _ = w.Write([]byte(conf))
 }
 
@@ -648,6 +648,26 @@ func sanitizeFilename(value string) string {
 		b.WriteRune('-')
 	}
 	return b.String()
+}
+
+func wireGuardFilename(accountNumber, deviceID string) string {
+	account := strings.ToLower(strings.TrimSpace(sanitizeFilename(accountNumber)))
+	if account == "" || account == "config" {
+		account = "account"
+	}
+	if len(account) > 16 {
+		account = account[:16]
+	}
+
+	device := strings.ToLower(strings.TrimSpace(sanitizeFilename(deviceID)))
+	if len(device) > 8 {
+		device = device[:8]
+	}
+	if device == "" || device == "config" {
+		return fmt.Sprintf("wg-%s.conf", account)
+	}
+
+	return fmt.Sprintf("wg-%s-%s.conf", account, device)
 }
 
 func looksLikeWireGuardPrivateKey(value string) bool {

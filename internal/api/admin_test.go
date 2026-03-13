@@ -115,6 +115,10 @@ func TestDownloadWireGuardConfig(t *testing.T) {
 	if !strings.Contains(res.Body.String(), "Endpoint = 203.0.113.10:51820") {
 		t.Fatalf("expected gateway endpoint in config")
 	}
+	cd := res.Header().Get("Content-Disposition")
+	if !strings.Contains(cd, "wg-acc0001-dev-1.conf") {
+		t.Fatalf("expected compact wireguard filename, got %q", cd)
+	}
 }
 
 func TestDownloadWireGuardQRCode(t *testing.T) {
