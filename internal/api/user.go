@@ -705,5 +705,3 @@ func (h *UserHandler) verifySupabasePasswordLogin(ctx context.Context, email, pa
 	}
 	return strings.TrimSpace(payload.User.ID), nil
 }
-    .bar { width: 100%; height: 8px; border-radius: 999px; background: #eee; margin-top: 4px; }
-    .bar > span { display: block; height: 100%; border-radius: 999px; background: #1565c0; }
