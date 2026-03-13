@@ -18,6 +18,7 @@ type AdminGatewaySummary struct {
 	Region        string
 	Provider      string
 	Active        bool
+	WGPort        int
 	PublicIPv4    string
 	PublicIPv6    string
 	WGPublicKey   string

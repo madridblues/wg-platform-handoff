@@ -517,6 +517,10 @@ func (h *AdminHandler) buildWireGuardConfig(ctx context.Context, backend adminRe
 	}
 
 	endpointIP := stripNetworkMask(strings.TrimSpace(selected.PublicIPv4))
+	listenPort := selected.WGPort
+	if listenPort <= 0 {
+		listenPort = 51820
+	}
 	conf := fmt.Sprintf(`[Interface]
 PrivateKey = %s
 Address = %s, %s
@@ -524,10 +528,10 @@ DNS = 1.1.1.1
 
 [Peer]
 PublicKey = %s
-Endpoint = %s:51820
+Endpoint = %s:%d
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
-`, privateKey, device.IPv4Address, device.IPv6Address, selected.WGPublicKey, endpointIP)
+`, privateKey, device.IPv4Address, device.IPv6Address, selected.WGPublicKey, endpointIP, listenPort)
 
 	return device, conf, nil
 }

@@ -384,22 +384,29 @@ func (s *Store) RegisterGateway(ctx context.Context, req domain.GatewayRegisterR
 
 	publicIPv6 := strings.TrimSpace(req.Metadata["public_ipv6"])
 	publicKey := strings.TrimSpace(req.Metadata["wg_public_key"])
+	listenPort := 51820
+	if rawPort := strings.TrimSpace(req.Metadata["wg_listen_port"]); rawPort != "" {
+		if parsed, err := strconv.Atoi(rawPort); err == nil && parsed > 0 && parsed <= 65535 {
+			listenPort = parsed
+		}
+	}
 
 	const query = `
 insert into relays (region, hostname, public_ipv4, public_ipv6, wg_port, active, weight, provider, wg_public_key)
-values ($1, $2, $3::inet, nullif($4, '')::inet, 51820, true, 100, $5, nullif($6, ''))
+values ($1, $2, $3::inet, nullif($4, '')::inet, $5, true, 100, $6, nullif($7, ''))
 on conflict (hostname) do update
 set
     region = excluded.region,
     public_ipv4 = excluded.public_ipv4,
     public_ipv6 = excluded.public_ipv6,
+    wg_port = excluded.wg_port,
     active = true,
     provider = excluded.provider,
     wg_public_key = excluded.wg_public_key,
     updated_at = now();
 `
 
-	if _, err := s.db.ExecContext(ctx, query, region, gatewayID, publicIPv4, publicIPv6, provider, publicKey); err != nil {
+	if _, err := s.db.ExecContext(ctx, query, region, gatewayID, publicIPv4, publicIPv6, listenPort, provider, publicKey); err != nil {
 		return fmt.Errorf("register gateway: %w", err)
 	}
 
@@ -762,6 +769,7 @@ select
     r.region,
     r.provider,
     r.active,
+    r.wg_port,
     r.public_ipv4::text,
     coalesce(r.public_ipv6::text, ''),
     coalesce(r.wg_public_key, ''),
@@ -798,6 +806,7 @@ limit $1;
 			&item.Region,
 			&item.Provider,
 			&item.Active,
+			&item.WGPort,
 			&item.PublicIPv4,
 			&item.PublicIPv6,
 			&item.WGPublicKey,

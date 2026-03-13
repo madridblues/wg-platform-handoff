@@ -156,6 +156,7 @@ func (s *fakeStore) AdminListGateways(_ context.Context, limit int) ([]domain.Ad
 			Region:        "uk-lon",
 			Provider:      "self",
 			Active:        true,
+			WGPort:        51820,
 			PublicIPv4:    "203.0.113.10",
 			WGPublicKey:   "pub",
 			LastStatus:    "healthy",
