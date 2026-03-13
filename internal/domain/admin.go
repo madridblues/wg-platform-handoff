@@ -24,3 +24,15 @@ type AdminGatewaySummary struct {
 	LastStatus    string
 	LastHeartbeat *time.Time
 }
+
+type AdminDeviceSummary struct {
+	ID            string
+	AccountID     string
+	AccountNumber string
+	Name          string
+	PubKey        string
+	HijackDNS     bool
+	CreatedAt     time.Time
+	IPv4Address   string
+	IPv6Address   string
+}

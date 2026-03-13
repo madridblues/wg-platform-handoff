@@ -24,6 +24,8 @@ const (
 type adminReadableStore interface {
 	AdminListAccounts(ctx context.Context, limit int) ([]domain.AdminAccountSummary, error)
 	AdminListGateways(ctx context.Context, limit int) ([]domain.AdminGatewaySummary, error)
+	AdminListDevices(ctx context.Context, limit int) ([]domain.AdminDeviceSummary, error)
+	AdminGetDeviceByAccountNumber(ctx context.Context, accountNumber, deviceID string) (domain.AdminDeviceSummary, error)
 }
 
 type AdminHandler struct {
@@ -41,6 +43,7 @@ type adminDashboardView struct {
 	GeneratedAt string
 	Accounts    []adminAccountRow
 	Gateways    []adminGatewayRow
+	Devices     []adminDeviceRow
 }
 
 type adminAccountRow struct {
@@ -61,6 +64,15 @@ type adminGatewayRow struct {
 	PublicIPv6    string
 	LastStatus    string
 	LastHeartbeat string
+}
+
+type adminDeviceRow struct {
+	AccountNumber string
+	DeviceID      string
+	DeviceName    string
+	IPv4Address   string
+	CreatedAt     string
+	DownloadURL   string
 }
 
 var adminLoginTemplate = template.Must(template.New("admin-login").Parse(`<!doctype html>
@@ -148,6 +160,24 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
         <tr>
           <td>{{.AccountNumber}}</td><td>{{.SupabaseUserID}}</td><td>{{.Status}}</td>
           <td>{{.Expiry}}</td><td>{{.DeviceCount}}</td><td>{{.UpdatedAt}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  <div class="section">
+    <h2>Devices</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Account</th><th>Device ID</th><th>Name</th><th>IPv4</th><th>Created</th><th>WireGuard Config</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Devices}}
+        <tr>
+          <td>{{.AccountNumber}}</td><td>{{.DeviceID}}</td><td>{{.DeviceName}}</td><td>{{.IPv4Address}}</td><td>{{.CreatedAt}}</td>
+          <td><a href="{{.DownloadURL}}">Download</a></td>
         </tr>
         {{end}}
       </tbody>
@@ -245,15 +275,89 @@ func (h *AdminHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load accounts", http.StatusInternalServerError)
 		return
 	}
+	devices, err := backend.AdminListDevices(r.Context(), 1000)
+	if err != nil {
+		http.Error(w, "failed to load devices", http.StatusInternalServerError)
+		return
+	}
 
 	view := adminDashboardView{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Accounts:    toAdminAccountRows(accounts),
 		Gateways:    toAdminGatewayRows(gateways),
+		Devices:     toAdminDeviceRows(devices),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = adminDashboardTemplate.Execute(w, view)
+}
+
+func (h *AdminHandler) DownloadWireGuardConfig(w http.ResponseWriter, r *http.Request) {
+	if !h.enabled() {
+		http.Error(w, "admin dashboard disabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	if !h.isAuthenticated(r) {
+		http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
+		return
+	}
+
+	backend, ok := h.store.(adminReadableStore)
+	if !ok {
+		http.Error(w, "admin backend unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	accountNumber := strings.TrimSpace(r.PathValue("account"))
+	deviceID := strings.TrimSpace(r.PathValue("device"))
+	if accountNumber == "" || deviceID == "" {
+		http.Error(w, "missing account/device path params", http.StatusBadRequest)
+		return
+	}
+
+	device, err := backend.AdminGetDeviceByAccountNumber(r.Context(), accountNumber, deviceID)
+	if err != nil {
+		http.Error(w, "device not found", http.StatusNotFound)
+		return
+	}
+
+	gateways, err := backend.AdminListGateways(r.Context(), 200)
+	if err != nil {
+		http.Error(w, "failed to load gateways", http.StatusInternalServerError)
+		return
+	}
+
+	var selected *domain.AdminGatewaySummary
+	for i := range gateways {
+		candidate := gateways[i]
+		if candidate.Active && strings.TrimSpace(candidate.WGPublicKey) != "" && strings.TrimSpace(candidate.PublicIPv4) != "" {
+			selected = &candidate
+			break
+		}
+	}
+	if selected == nil {
+		http.Error(w, "no active gateway with wireguard key", http.StatusServiceUnavailable)
+		return
+	}
+
+	endpointIP := stripNetworkMask(strings.TrimSpace(selected.PublicIPv4))
+	conf := fmt.Sprintf(`[Interface]
+PrivateKey = [REPLACE_WITH_CLIENT_PRIVATE_KEY]
+Address = %s, %s
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = %s
+Endpoint = %s:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+`, device.IPv4Address, device.IPv6Address, selected.WGPublicKey, endpointIP)
+
+	filename := fmt.Sprintf("%s-%s.conf", sanitizeFilename(device.AccountNumber), sanitizeFilename(device.ID))
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	_, _ = w.Write([]byte(conf))
 }
 
 func (h *AdminHandler) renderLogin(w http.ResponseWriter, errorText string) {
@@ -348,6 +452,28 @@ func requestIsHTTPS(r *http.Request) bool {
 	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
+func stripNetworkMask(value string) string {
+	if idx := strings.Index(value, "/"); idx > 0 {
+		return strings.TrimSpace(value[:idx])
+	}
+	return strings.TrimSpace(value)
+}
+
+func sanitizeFilename(value string) string {
+	if value == "" {
+		return "config"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteRune('-')
+	}
+	return b.String()
+}
+
 func toAdminAccountRows(items []domain.AdminAccountSummary) []adminAccountRow {
 	out := make([]adminAccountRow, 0, len(items))
 	for _, item := range items {
@@ -380,6 +506,21 @@ func toAdminGatewayRows(items []domain.AdminGatewaySummary) []adminGatewayRow {
 			PublicIPv6:    item.PublicIPv6,
 			LastStatus:    item.LastStatus,
 			LastHeartbeat: heartbeat,
+		})
+	}
+	return out
+}
+
+func toAdminDeviceRows(items []domain.AdminDeviceSummary) []adminDeviceRow {
+	out := make([]adminDeviceRow, 0, len(items))
+	for _, item := range items {
+		out = append(out, adminDeviceRow{
+			AccountNumber: item.AccountNumber,
+			DeviceID:      item.ID,
+			DeviceName:    item.Name,
+			IPv4Address:   item.IPv4Address,
+			CreatedAt:     formatTS(item.CreatedAt),
+			DownloadURL:   fmt.Sprintf("/admin/wireguard-config/%s/%s", item.AccountNumber, item.ID),
 		})
 	}
 	return out

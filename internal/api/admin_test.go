@@ -1,11 +1,14 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"wg-platform-handoff/internal/domain"
 )
 
 func TestAdminLoginAndDashboard(t *testing.T) {
@@ -58,5 +61,57 @@ func TestAdminDashboardRedirectsWithoutSession(t *testing.T) {
 	location := res.Header().Get("Location")
 	if location != "/admin/login" {
 		t.Fatalf("expected redirect to /admin/login, got %q", location)
+	}
+}
+
+func TestDownloadWireGuardConfig(t *testing.T) {
+	store := newFakeStore()
+	store.devices = append(store.devices, domain.Device{
+		ID:          "dev-1",
+		Name:        "device-1",
+		PubKey:      "test-pubkey",
+		HijackDNS:   false,
+		Created:     time.Now().UTC(),
+		IPv4Address: "10.64.0.2/32",
+		IPv6Address: "fd00::2/128",
+	})
+
+	admin := NewAdminHandler(store, "topsecret", "session-secret", 1*time.Hour)
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/admin/login", strings.NewReader("password=topsecret"))
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRes := httptest.NewRecorder()
+	admin.LoginSubmit(loginRes, loginReq)
+	if loginRes.Code != http.StatusSeeOther {
+		t.Fatalf("expected login status 303, got %d", loginRes.Code)
+	}
+
+	var sessionCookie *http.Cookie
+	for _, cookie := range loginRes.Result().Cookies() {
+		if cookie.Name == adminSessionCookieName {
+			sessionCookie = cookie
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatalf("expected admin session cookie")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/wireguard-config/ACC0001/dev-1", nil)
+	req = req.WithContext(context.Background())
+	req.SetPathValue("account", "ACC0001")
+	req.SetPathValue("device", "dev-1")
+	req.AddCookie(sessionCookie)
+
+	res := httptest.NewRecorder()
+	admin.DownloadWireGuardConfig(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), "PrivateKey = [REPLACE_WITH_CLIENT_PRIVATE_KEY]") {
+		t.Fatalf("expected private key placeholder in config")
+	}
+	if !strings.Contains(res.Body.String(), "Endpoint = 203.0.113.10:51820") {
+		t.Fatalf("expected gateway endpoint in config")
 	}
 }

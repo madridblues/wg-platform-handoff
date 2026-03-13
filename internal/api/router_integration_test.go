@@ -168,6 +168,49 @@ func (s *fakeStore) AdminListGateways(_ context.Context, limit int) ([]domain.Ad
 	return rows, nil
 }
 
+func (s *fakeStore) AdminListDevices(_ context.Context, limit int) ([]domain.AdminDeviceSummary, error) {
+	rows := make([]domain.AdminDeviceSummary, 0, len(s.devices))
+	for _, d := range s.devices {
+		rows = append(rows, domain.AdminDeviceSummary{
+			ID:            d.ID,
+			AccountID:     s.account.ID,
+			AccountNumber: s.account.Number,
+			Name:          d.Name,
+			PubKey:        d.PubKey,
+			HijackDNS:     d.HijackDNS,
+			CreatedAt:     d.Created,
+			IPv4Address:   d.IPv4Address,
+			IPv6Address:   d.IPv6Address,
+		})
+	}
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+func (s *fakeStore) AdminGetDeviceByAccountNumber(_ context.Context, accountNumber, deviceID string) (domain.AdminDeviceSummary, error) {
+	if !strings.EqualFold(strings.TrimSpace(accountNumber), s.account.Number) {
+		return domain.AdminDeviceSummary{}, errors.New("not found")
+	}
+	for _, d := range s.devices {
+		if d.ID == deviceID {
+			return domain.AdminDeviceSummary{
+				ID:            d.ID,
+				AccountID:     s.account.ID,
+				AccountNumber: s.account.Number,
+				Name:          d.Name,
+				PubKey:        d.PubKey,
+				HijackDNS:     d.HijackDNS,
+				CreatedAt:     d.Created,
+				IPv4Address:   d.IPv4Address,
+				IPv6Address:   d.IPv6Address,
+			}, nil
+		}
+	}
+	return domain.AdminDeviceSummary{}, errors.New("not found")
+}
+
 func buildTestRouter(gatewayToken string) http.Handler {
 	cfg := config.Config{
 		GatewayToken:      gatewayToken,

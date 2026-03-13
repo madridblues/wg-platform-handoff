@@ -822,6 +822,106 @@ limit $1;
 	return out, nil
 }
 
+func (s *Store) AdminListDevices(ctx context.Context, limit int) ([]domain.AdminDeviceSummary, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	const query = `
+select
+    d.id::text,
+    d.account_id::text,
+    a.account_number,
+    d.name,
+    d.pubkey,
+    d.hijack_dns,
+    d.created_at,
+    d.ipv4_address::text,
+    d.ipv6_address::text
+from devices d
+join accounts a on a.id = d.account_id
+order by d.created_at desc
+limit $1;
+`
+
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("admin list devices: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]domain.AdminDeviceSummary, 0)
+	for rows.Next() {
+		var item domain.AdminDeviceSummary
+		if err := rows.Scan(
+			&item.ID,
+			&item.AccountID,
+			&item.AccountNumber,
+			&item.Name,
+			&item.PubKey,
+			&item.HijackDNS,
+			&item.CreatedAt,
+			&item.IPv4Address,
+			&item.IPv6Address,
+		); err != nil {
+			return nil, fmt.Errorf("admin scan device: %w", err)
+		}
+		out = append(out, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("admin iterate devices: %w", err)
+	}
+
+	return out, nil
+}
+
+func (s *Store) AdminGetDeviceByAccountNumber(ctx context.Context, accountNumber, deviceID string) (domain.AdminDeviceSummary, error) {
+	accountNumber = strings.TrimSpace(accountNumber)
+	deviceID = strings.TrimSpace(deviceID)
+	if accountNumber == "" || deviceID == "" {
+		return domain.AdminDeviceSummary{}, errors.New("account number and device id are required")
+	}
+
+	const query = `
+select
+    d.id::text,
+    d.account_id::text,
+    a.account_number,
+    d.name,
+    d.pubkey,
+    d.hijack_dns,
+    d.created_at,
+    d.ipv4_address::text,
+    d.ipv6_address::text
+from devices d
+join accounts a on a.id = d.account_id
+where a.account_number = $1 and d.id = $2::uuid
+limit 1;
+`
+
+	var item domain.AdminDeviceSummary
+	err := s.db.QueryRowContext(ctx, query, accountNumber, deviceID).Scan(
+		&item.ID,
+		&item.AccountID,
+		&item.AccountNumber,
+		&item.Name,
+		&item.PubKey,
+		&item.HijackDNS,
+		&item.CreatedAt,
+		&item.IPv4Address,
+		&item.IPv6Address,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.AdminDeviceSummary{}, errNotFound
+	}
+	if err != nil {
+		return domain.AdminDeviceSummary{}, fmt.Errorf("admin get device by account number: %w", err)
+	}
+
+	return item, nil
+}
+
 func (s *Store) resolveAccountIDForBilling(ctx context.Context, tx *sql.Tx, provider string, event domain.BillingEvent) (string, error) {
 	if accountNumber := strings.TrimSpace(event.AccountNumber); accountNumber != "" {
 		var accountID string
