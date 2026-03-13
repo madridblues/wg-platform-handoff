@@ -252,7 +252,7 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
                 <option value="split">Split tunnel</option>
               </select>
               <button type="button" onclick="generateKey('{{.AccountNumber}}','{{.DeviceID}}')">Generate key</button>
-              <button type="submit" formmethod="post" formaction="/admin/wireguard-config-auto/{{.AccountNumber}}/{{.DeviceID}}">Generate + Download</button>
+              <button type="submit" formmethod="post" formaction="/admin/wireguard-config-auto?account={{.AccountNumber}}&device={{.DeviceID}}">Generate + Download</button>
               <button type="submit">Download</button>
               <button type="submit" formaction="{{.QRURL}}" formtarget="_blank">QR</button>
             </form>
@@ -457,6 +457,12 @@ func (h *AdminHandler) GenerateAndDownloadWireGuardConfig(w http.ResponseWriter,
 
 	accountNumber := strings.TrimSpace(r.PathValue("account"))
 	deviceID := strings.TrimSpace(r.PathValue("device"))
+	if accountNumber == "" {
+		accountNumber = strings.TrimSpace(r.URL.Query().Get("account"))
+	}
+	if deviceID == "" {
+		deviceID = strings.TrimSpace(r.URL.Query().Get("device"))
+	}
 	if accountNumber == "" || deviceID == "" {
 		http.Error(w, "missing account/device path params", http.StatusBadRequest)
 		return
