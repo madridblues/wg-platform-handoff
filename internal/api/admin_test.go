@@ -97,7 +97,7 @@ func TestDownloadWireGuardConfig(t *testing.T) {
 		t.Fatalf("expected admin session cookie")
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/admin/wireguard-config/ACC0001/dev-1?private_key=SGjouTg84AjrQtXgidUm6p7XlFi5c1rC4c+bSK25r10=", nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/wireguard-config/ACC0001/dev-1?private_key=SGjouTg84AjrQtXgidUm6p7XlFi5c1rC4c%2BbSK25r10%3D", nil)
 	req = req.WithContext(context.Background())
 	req.SetPathValue("account", "ACC0001")
 	req.SetPathValue("device", "dev-1")
