@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"html/template"
@@ -177,7 +178,12 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
         {{range .Devices}}
         <tr>
           <td>{{.AccountNumber}}</td><td>{{.DeviceID}}</td><td>{{.DeviceName}}</td><td>{{.IPv4Address}}</td><td>{{.CreatedAt}}</td>
-          <td><a href="{{.DownloadURL}}">Download</a></td>
+          <td>
+            <form method="get" action="{{.DownloadURL}}">
+              <input type="text" name="private_key" placeholder="Client private key (base64)" required />
+              <button type="submit">Download</button>
+            </form>
+          </td>
         </tr>
         {{end}}
       </tbody>
@@ -311,8 +317,13 @@ func (h *AdminHandler) DownloadWireGuardConfig(w http.ResponseWriter, r *http.Re
 
 	accountNumber := strings.TrimSpace(r.PathValue("account"))
 	deviceID := strings.TrimSpace(r.PathValue("device"))
+	privateKey := strings.TrimSpace(r.URL.Query().Get("private_key"))
 	if accountNumber == "" || deviceID == "" {
 		http.Error(w, "missing account/device path params", http.StatusBadRequest)
+		return
+	}
+	if !looksLikeWireGuardPrivateKey(privateKey) {
+		http.Error(w, "missing or invalid private_key query parameter", http.StatusBadRequest)
 		return
 	}
 
@@ -343,7 +354,7 @@ func (h *AdminHandler) DownloadWireGuardConfig(w http.ResponseWriter, r *http.Re
 
 	endpointIP := stripNetworkMask(strings.TrimSpace(selected.PublicIPv4))
 	conf := fmt.Sprintf(`[Interface]
-PrivateKey = [REPLACE_WITH_CLIENT_PRIVATE_KEY]
+PrivateKey = %s
 Address = %s, %s
 DNS = 1.1.1.1
 
@@ -352,7 +363,7 @@ PublicKey = %s
 Endpoint = %s:51820
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
-`, device.IPv4Address, device.IPv6Address, selected.WGPublicKey, endpointIP)
+`, privateKey, device.IPv4Address, device.IPv6Address, selected.WGPublicKey, endpointIP)
 
 	filename := fmt.Sprintf("%s-%s.conf", sanitizeFilename(device.AccountNumber), sanitizeFilename(device.ID))
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -472,6 +483,14 @@ func sanitizeFilename(value string) string {
 		b.WriteRune('-')
 	}
 	return b.String()
+}
+
+func looksLikeWireGuardPrivateKey(value string) bool {
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value))
+	if err != nil {
+		return false
+	}
+	return len(decoded) == 32
 }
 
 func toAdminAccountRows(items []domain.AdminAccountSummary) []adminAccountRow {

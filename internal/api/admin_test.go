@@ -97,7 +97,7 @@ func TestDownloadWireGuardConfig(t *testing.T) {
 		t.Fatalf("expected admin session cookie")
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/admin/wireguard-config/ACC0001/dev-1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/wireguard-config/ACC0001/dev-1?private_key=SGjouTg84AjrQtXgidUm6p7XlFi5c1rC4c+bSK25r10=", nil)
 	req = req.WithContext(context.Background())
 	req.SetPathValue("account", "ACC0001")
 	req.SetPathValue("device", "dev-1")
@@ -108,8 +108,8 @@ func TestDownloadWireGuardConfig(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
 	}
-	if !strings.Contains(res.Body.String(), "PrivateKey = [REPLACE_WITH_CLIENT_PRIVATE_KEY]") {
-		t.Fatalf("expected private key placeholder in config")
+	if !strings.Contains(res.Body.String(), "PrivateKey = SGjouTg84AjrQtXgidUm6p7XlFi5c1rC4c+bSK25r10=") {
+		t.Fatalf("expected provided private key in config")
 	}
 	if !strings.Contains(res.Body.String(), "Endpoint = 203.0.113.10:51820") {
 		t.Fatalf("expected gateway endpoint in config")
