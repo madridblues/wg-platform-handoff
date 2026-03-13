@@ -31,7 +31,7 @@ type adminReadableStore interface {
 	AdminListGateways(ctx context.Context, limit int) ([]domain.AdminGatewaySummary, error)
 	AdminListDevices(ctx context.Context, limit int) ([]domain.AdminDeviceSummary, error)
 	AdminGetDeviceByAccountNumber(ctx context.Context, accountNumber, deviceID string) (domain.AdminDeviceSummary, error)
-	AdminReplaceDeviceKeyByAccountNumber(ctx context.Context, accountNumber, deviceID, pubkey string) (domain.AdminDeviceSummary, error)
+	AdminReplaceDeviceKeyByAccountNumber(ctx context.Context, accountNumber, deviceID, pubkey, presharedKey string) (domain.AdminDeviceSummary, error)
 }
 
 type AdminHandler struct {
@@ -69,11 +69,13 @@ type adminGatewayRow struct {
 	Hostname      string
 	Region        string
 	Provider      string
+	WGPort        int
 	Active        string
 	PublicIPv4    string
 	PublicIPv6    string
 	LastStatus    string
 	LastHeartbeat string
+	LastApply     string
 }
 
 type adminDeviceRow struct {
@@ -156,15 +158,15 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
     <table>
       <thead>
         <tr>
-          <th>Hostname</th><th>Region</th><th>Provider</th><th>Active</th>
-          <th>Public IPv4</th><th>Public IPv6</th><th>Status</th><th>Last Heartbeat</th>
+          <th>Hostname</th><th>Region</th><th>Provider</th><th>Port</th><th>Active</th>
+          <th>Public IPv4</th><th>Status</th><th>Last Heartbeat</th><th>Last Apply</th>
         </tr>
       </thead>
       <tbody>
         {{range .Gateways}}
         <tr>
-          <td>{{.Hostname}}</td><td>{{.Region}}</td><td>{{.Provider}}</td><td>{{.Active}}</td>
-          <td>{{.PublicIPv4}}</td><td>{{.PublicIPv6}}</td><td>{{.LastStatus}}</td><td>{{.LastHeartbeat}}</td>
+          <td>{{.Hostname}}</td><td>{{.Region}}</td><td>{{.Provider}}</td><td>{{.WGPort}}</td><td>{{.Active}}</td>
+          <td>{{.PublicIPv4}}</td><td>{{.LastStatus}}</td><td>{{.LastHeartbeat}}</td><td>{{.LastApply}}</td>
         </tr>
         {{end}}
       </tbody>
@@ -205,6 +207,10 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Parse
           <td>
             <form class="wg-form" method="get" action="{{.DownloadURL}}">
               <input id="pk-{{.DeviceID}}" type="text" name="private_key" placeholder="Client private key (base64)" required />
+              <select name="mode">
+                <option value="full">Full tunnel</option>
+                <option value="split">Split tunnel</option>
+              </select>
               <button type="button" onclick="generateKey('{{.AccountNumber}}','{{.DeviceID}}')">Generate key</button>
               <button type="submit">Download</button>
               <button type="submit" formaction="{{.QRURL}}" formtarget="_blank">QR</button>
@@ -367,7 +373,7 @@ func (h *AdminHandler) DownloadWireGuardConfig(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	device, conf, err := h.buildWireGuardConfig(r.Context(), backend, r.PathValue("account"), r.PathValue("device"), r.URL.Query().Get("private_key"))
+	device, conf, err := h.buildWireGuardConfig(r.Context(), backend, r.PathValue("account"), r.PathValue("device"), r.URL.Query().Get("private_key"), r.URL.Query().Get("mode"))
 	if err != nil {
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "private_key") || strings.Contains(err.Error(), "missing account/device") {
@@ -406,7 +412,7 @@ func (h *AdminHandler) DownloadWireGuardQRCode(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	_, conf, err := h.buildWireGuardConfig(r.Context(), backend, r.PathValue("account"), r.PathValue("device"), r.URL.Query().Get("private_key"))
+	_, conf, err := h.buildWireGuardConfig(r.Context(), backend, r.PathValue("account"), r.PathValue("device"), r.URL.Query().Get("private_key"), r.URL.Query().Get("mode"))
 	if err != nil {
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "private_key") || strings.Contains(err.Error(), "missing account/device") {
@@ -455,13 +461,18 @@ func (h *AdminHandler) GenerateAndSyncWireGuardKey(w http.ResponseWriter, r *htt
 		return
 	}
 
-	privateKey, publicKey, err := generateWireGuardKeypair()
+ 	privateKey, publicKey, err := generateWireGuardKeypair()
 	if err != nil {
 		http.Error(w, "failed to generate keypair", http.StatusInternalServerError)
 		return
 	}
+	presharedKey, err := generateWireGuardPresharedKey()
+	if err != nil {
+		http.Error(w, "failed to generate preshared key", http.StatusInternalServerError)
+		return
+	}
 
-	device, err := backend.AdminReplaceDeviceKeyByAccountNumber(r.Context(), accountNumber, deviceID, publicKey)
+	device, err := backend.AdminReplaceDeviceKeyByAccountNumber(r.Context(), accountNumber, deviceID, publicKey, presharedKey)
 	if err != nil {
 		http.Error(w, "failed to sync device key", http.StatusInternalServerError)
 		return
@@ -473,10 +484,11 @@ func (h *AdminHandler) GenerateAndSyncWireGuardKey(w http.ResponseWriter, r *htt
 		"device_id":      device.ID,
 		"public_key":     publicKey,
 		"private_key":    privateKey,
+		"preshared_key":  presharedKey,
 	})
 }
 
-func (h *AdminHandler) buildWireGuardConfig(ctx context.Context, backend adminReadableStore, accountPathValue, devicePathValue, privateKeyRaw string) (domain.AdminDeviceSummary, string, error) {
+func (h *AdminHandler) buildWireGuardConfig(ctx context.Context, backend adminReadableStore, accountPathValue, devicePathValue, privateKeyRaw, modeRaw string) (domain.AdminDeviceSummary, string, error) {
 	accountNumber := strings.TrimSpace(accountPathValue)
 	deviceID := strings.TrimSpace(devicePathValue)
 	privateKey := strings.TrimSpace(privateKeyRaw)
@@ -521,6 +533,16 @@ func (h *AdminHandler) buildWireGuardConfig(ctx context.Context, backend adminRe
 	if listenPort <= 0 {
 		listenPort = 51820
 	}
+	allowedIPs := "0.0.0.0/0, ::/0"
+	switch strings.ToLower(strings.TrimSpace(modeRaw)) {
+	case "split":
+		allowedIPs = "10.64.0.0/24, fd00::/64"
+	}
+
+	pskLine := ""
+	if strings.TrimSpace(device.PresharedKey) != "" {
+		pskLine = "PresharedKey = " + strings.TrimSpace(device.PresharedKey) + "\n"
+	}
 	conf := fmt.Sprintf(`[Interface]
 PrivateKey = %s
 Address = %s, %s
@@ -528,10 +550,10 @@ DNS = 1.1.1.1
 
 [Peer]
 PublicKey = %s
-Endpoint = %s:%d
-AllowedIPs = 0.0.0.0/0, ::/0
+%sEndpoint = %s:%d
+AllowedIPs = %s
 PersistentKeepalive = 25
-`, privateKey, device.IPv4Address, device.IPv6Address, selected.WGPublicKey, endpointIP, listenPort)
+`, privateKey, device.IPv4Address, device.IPv6Address, selected.WGPublicKey, pskLine, endpointIP, listenPort, allowedIPs)
 
 	return device, conf, nil
 }
@@ -697,6 +719,14 @@ func generateWireGuardKeypair() (string, string, error) {
 	return privateKey, publicKey, nil
 }
 
+func generateWireGuardPresharedKey() (string, error) {
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(key[:]), nil
+}
+
 func wireGuardPublicKeyFromPrivate(privateKey string) (string, error) {
 	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(privateKey))
 	if err != nil {
@@ -735,16 +765,25 @@ func toAdminGatewayRows(items []domain.AdminGatewaySummary) []adminGatewayRow {
 		if item.LastHeartbeat != nil {
 			heartbeat = formatTS(*item.LastHeartbeat)
 		}
+		lastApply := strings.TrimSpace(item.LastApply)
+		if lastApply == "" {
+			lastApply = "n/a"
+		}
+		if item.LastApplyAt != nil {
+			lastApply = lastApply + " @ " + formatTS(*item.LastApplyAt)
+		}
 
 		out = append(out, adminGatewayRow{
 			Hostname:      item.Hostname,
 			Region:        item.Region,
 			Provider:      item.Provider,
+			WGPort:        item.WGPort,
 			Active:        fmt.Sprintf("%t", item.Active),
 			PublicIPv4:    item.PublicIPv4,
 			PublicIPv6:    item.PublicIPv6,
 			LastStatus:    item.LastStatus,
 			LastHeartbeat: heartbeat,
+			LastApply:     lastApply,
 		})
 	}
 	return out

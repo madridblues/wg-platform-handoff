@@ -415,7 +415,7 @@ set
 
 func (s *Store) DesiredGatewayConfig(ctx context.Context, gatewayID string) (domain.GatewayDesiredConfigResponse, error) {
 	const peerQuery = `
-select pubkey, ipv4_address::text, ipv6_address::text
+select pubkey, ipv4_address::text, ipv6_address::text, coalesce(preshared_key, '')
 from devices
 order by created_at desc
 limit 2000;
@@ -433,15 +433,19 @@ limit 2000;
 			pubkey string
 			ipv4   string
 			ipv6   string
+			psk    string
 		)
-		if err := rows.Scan(&pubkey, &ipv4, &ipv6); err != nil {
+		if err := rows.Scan(&pubkey, &ipv4, &ipv6, &psk); err != nil {
 			return domain.GatewayDesiredConfigResponse{}, fmt.Errorf("scan desired peer: %w", err)
 		}
-
-		peers = append(peers, map[string]any{
+		peer := map[string]any{
 			"public_key":  pubkey,
 			"allowed_ips": []string{ipv4, ipv6},
-		})
+		}
+		if strings.TrimSpace(psk) != "" {
+			peer["preshared_key"] = strings.TrimSpace(psk)
+		}
+		peers = append(peers, peer)
 	}
 
 	if err := rows.Err(); err != nil {
@@ -762,7 +766,7 @@ func (s *Store) AdminListGateways(ctx context.Context, limit int) ([]domain.Admi
 		limit = 200
 	}
 
-	const query = `
+const query = `
 select
     r.id::text,
     r.hostname,
@@ -774,7 +778,9 @@ select
     coalesce(r.public_ipv6::text, ''),
     coalesce(r.wg_public_key, ''),
     coalesce(h.status, 'unknown'),
-    h.received_at
+    h.received_at,
+    coalesce(a.result, 'n/a'),
+    a.created_at
 from relays r
 left join lateral (
     select status, received_at
@@ -783,6 +789,13 @@ left join lateral (
     order by rh.received_at desc
     limit 1
 ) h on true
+left join lateral (
+    select result, created_at
+    from gateway_apply_events ga
+    where ga.relay_id = r.id
+    order by ga.created_at desc
+    limit 1
+) a on true
 order by r.updated_at desc
 limit $1;
 `
@@ -798,6 +811,7 @@ limit $1;
 		var (
 			item          domain.AdminGatewaySummary
 			lastHeartbeat sql.NullTime
+			lastApplyAt   sql.NullTime
 		)
 
 		if err := rows.Scan(
@@ -812,6 +826,8 @@ limit $1;
 			&item.WGPublicKey,
 			&item.LastStatus,
 			&lastHeartbeat,
+			&item.LastApply,
+			&lastApplyAt,
 		); err != nil {
 			return nil, fmt.Errorf("admin scan gateway: %w", err)
 		}
@@ -819,6 +835,10 @@ limit $1;
 		if lastHeartbeat.Valid {
 			t := lastHeartbeat.Time.UTC()
 			item.LastHeartbeat = &t
+		}
+		if lastApplyAt.Valid {
+			t := lastApplyAt.Time.UTC()
+			item.LastApplyAt = &t
 		}
 
 		out = append(out, item)
@@ -843,6 +863,7 @@ select
     a.account_number,
     d.name,
     d.pubkey,
+    coalesce(d.preshared_key, ''),
     d.hijack_dns,
     d.created_at,
     d.ipv4_address::text,
@@ -868,6 +889,7 @@ limit $1;
 			&item.AccountNumber,
 			&item.Name,
 			&item.PubKey,
+			&item.PresharedKey,
 			&item.HijackDNS,
 			&item.CreatedAt,
 			&item.IPv4Address,
@@ -899,6 +921,7 @@ select
     a.account_number,
     d.name,
     d.pubkey,
+    coalesce(d.preshared_key, ''),
     d.hijack_dns,
     d.created_at,
     d.ipv4_address::text,
@@ -916,6 +939,7 @@ limit 1;
 		&item.AccountNumber,
 		&item.Name,
 		&item.PubKey,
+		&item.PresharedKey,
 		&item.HijackDNS,
 		&item.CreatedAt,
 		&item.IPv4Address,
@@ -931,18 +955,20 @@ limit 1;
 	return item, nil
 }
 
-func (s *Store) AdminReplaceDeviceKeyByAccountNumber(ctx context.Context, accountNumber, deviceID, pubkey string) (domain.AdminDeviceSummary, error) {
+func (s *Store) AdminReplaceDeviceKeyByAccountNumber(ctx context.Context, accountNumber, deviceID, pubkey, presharedKey string) (domain.AdminDeviceSummary, error) {
 	accountNumber = strings.TrimSpace(accountNumber)
 	deviceID = strings.TrimSpace(deviceID)
 	pubkey = strings.TrimSpace(pubkey)
 	if accountNumber == "" || deviceID == "" || pubkey == "" {
 		return domain.AdminDeviceSummary{}, errors.New("account number, device id, and pubkey are required")
 	}
+	presharedKey = strings.TrimSpace(presharedKey)
 
 	const query = `
 update devices d
 set
     pubkey = $3,
+    preshared_key = nullif($4, ''),
     updated_at = now()
 from accounts a
 where d.account_id = a.id
@@ -954,6 +980,7 @@ returning
     a.account_number,
     d.name,
     d.pubkey,
+    coalesce(d.preshared_key, ''),
     d.hijack_dns,
     d.created_at,
     d.ipv4_address::text,
@@ -961,12 +988,13 @@ returning
 `
 
 	var item domain.AdminDeviceSummary
-	err := s.db.QueryRowContext(ctx, query, accountNumber, deviceID, pubkey).Scan(
+	err := s.db.QueryRowContext(ctx, query, accountNumber, deviceID, pubkey, presharedKey).Scan(
 		&item.ID,
 		&item.AccountID,
 		&item.AccountNumber,
 		&item.Name,
 		&item.PubKey,
+		&item.PresharedKey,
 		&item.HijackDNS,
 		&item.CreatedAt,
 		&item.IPv4Address,

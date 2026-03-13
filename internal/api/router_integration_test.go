@@ -178,6 +178,7 @@ func (s *fakeStore) AdminListDevices(_ context.Context, limit int) ([]domain.Adm
 			AccountNumber: s.account.Number,
 			Name:          d.Name,
 			PubKey:        d.PubKey,
+			PresharedKey:  "",
 			HijackDNS:     d.HijackDNS,
 			CreatedAt:     d.Created,
 			IPv4Address:   d.IPv4Address,
@@ -202,6 +203,7 @@ func (s *fakeStore) AdminGetDeviceByAccountNumber(_ context.Context, accountNumb
 				AccountNumber: s.account.Number,
 				Name:          d.Name,
 				PubKey:        d.PubKey,
+				PresharedKey:  "",
 				HijackDNS:     d.HijackDNS,
 				CreatedAt:     d.Created,
 				IPv4Address:   d.IPv4Address,
@@ -212,7 +214,7 @@ func (s *fakeStore) AdminGetDeviceByAccountNumber(_ context.Context, accountNumb
 	return domain.AdminDeviceSummary{}, errors.New("not found")
 }
 
-func (s *fakeStore) AdminReplaceDeviceKeyByAccountNumber(_ context.Context, accountNumber, deviceID, pubkey string) (domain.AdminDeviceSummary, error) {
+func (s *fakeStore) AdminReplaceDeviceKeyByAccountNumber(_ context.Context, accountNumber, deviceID, pubkey, presharedKey string) (domain.AdminDeviceSummary, error) {
 	if !strings.EqualFold(strings.TrimSpace(accountNumber), s.account.Number) {
 		return domain.AdminDeviceSummary{}, errors.New("not found")
 	}
@@ -226,6 +228,7 @@ func (s *fakeStore) AdminReplaceDeviceKeyByAccountNumber(_ context.Context, acco
 				AccountNumber: s.account.Number,
 				Name:          d.Name,
 				PubKey:        d.PubKey,
+				PresharedKey:  presharedKey,
 				HijackDNS:     d.HijackDNS,
 				CreatedAt:     d.Created,
 				IPv4Address:   d.IPv4Address,

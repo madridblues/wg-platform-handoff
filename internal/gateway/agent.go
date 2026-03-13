@@ -40,6 +40,7 @@ func (r systemCommandRunner) RunWithInput(ctx context.Context, input []byte, nam
 
 type wireGuardPeer struct {
 	PublicKey  string
+	Preshared  string
 	AllowedIPs []string
 }
 
@@ -48,6 +49,7 @@ type Agent struct {
 	client             *http.Client
 	runner             commandRunner
 	lastAppliedVersion int64
+	lastPeerCount      int
 }
 
 func NewAgent(cfg config.Config) *Agent {
@@ -131,6 +133,7 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		"metrics": map[string]any{
 			"apply_enabled":   a.cfg.GatewayWGApplyEnabled,
 			"applied_version": a.lastAppliedVersion,
+			"configured_peers": a.lastPeerCount,
 		},
 	}
 	return a.postJSON(ctx, endpoint, payload)
@@ -173,6 +176,7 @@ func (a *Agent) fetchAndApply(ctx context.Context) error {
 	if desired.Version > 0 {
 		a.lastAppliedVersion = desired.Version
 	}
+	a.lastPeerCount = len(desired.Peers)
 
 	return nil
 }
@@ -348,9 +352,11 @@ func parseDesiredPeers(rawPeers []map[string]any) ([]wireGuardPeer, error) {
 		if len(allowedIPs) == 0 {
 			continue
 		}
+		preshared := strings.TrimSpace(stringFromAny(raw["preshared_key"]))
 
 		dedupe[publicKey] = wireGuardPeer{
 			PublicKey:  publicKey,
+			Preshared:  preshared,
 			AllowedIPs: allowedIPs,
 		}
 	}
@@ -384,6 +390,11 @@ func renderWireGuardConfig(privateKey string, listenPort int, peers []wireGuardP
 		builder.WriteString("PublicKey = ")
 		builder.WriteString(peer.PublicKey)
 		builder.WriteString("\n")
+		if strings.TrimSpace(peer.Preshared) != "" {
+			builder.WriteString("PresharedKey = ")
+			builder.WriteString(strings.TrimSpace(peer.Preshared))
+			builder.WriteString("\n")
+		}
 		builder.WriteString("AllowedIPs = ")
 		builder.WriteString(strings.Join(peer.AllowedIPs, ", "))
 		builder.WriteString("\n\n")

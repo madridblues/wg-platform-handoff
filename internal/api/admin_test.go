@@ -221,6 +221,9 @@ func TestGenerateAndSyncWireGuardKey(t *testing.T) {
 	if payload["private_key"] == "" || payload["public_key"] == "" {
 		t.Fatalf("expected generated keypair payload")
 	}
+	if payload["preshared_key"] == "" {
+		t.Fatalf("expected generated preshared key")
+	}
 	if store.devices[0].PubKey != payload["public_key"] {
 		t.Fatalf("expected device pubkey to be synced")
 	}

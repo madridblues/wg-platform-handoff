@@ -14,6 +14,7 @@ func TestParseDesiredPeersFiltersAndDedupes(t *testing.T) {
 		{
 			"public_key":  "peer-a",
 			"allowed_ips": []string{"10.64.0.3/32"},
+			"preshared_key": "psk-1",
 		},
 		{
 			"public_key":  "",
@@ -35,12 +36,16 @@ func TestParseDesiredPeersFiltersAndDedupes(t *testing.T) {
 	if len(peers[0].AllowedIPs) != 1 || peers[0].AllowedIPs[0] != "10.64.0.3/32" {
 		t.Fatalf("expected newest deduped allowed IPs, got %+v", peers[0].AllowedIPs)
 	}
+	if peers[0].Preshared != "psk-1" {
+		t.Fatalf("expected preshared key to be preserved")
+	}
 }
 
 func TestRenderWireGuardConfig(t *testing.T) {
 	conf := renderWireGuardConfig("private-key", 51820, []wireGuardPeer{
 		{
 			PublicKey:  "peer-a",
+			Preshared:  "psk-1",
 			AllowedIPs: []string{"10.64.0.2/32", "fd00::2/128"},
 		},
 	})
@@ -51,6 +56,7 @@ func TestRenderWireGuardConfig(t *testing.T) {
 		"ListenPort = 51820",
 		"[Peer]",
 		"PublicKey = peer-a",
+		"PresharedKey = psk-1",
 		"AllowedIPs = 10.64.0.2/32, fd00::2/128",
 	}
 

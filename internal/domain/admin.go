@@ -24,6 +24,8 @@ type AdminGatewaySummary struct {
 	WGPublicKey   string
 	LastStatus    string
 	LastHeartbeat *time.Time
+	LastApply     string
+	LastApplyAt   *time.Time
 }
 
 type AdminDeviceSummary struct {
@@ -32,6 +34,7 @@ type AdminDeviceSummary struct {
 	AccountNumber string
 	Name          string
 	PubKey        string
+	PresharedKey  string
 	HijackDNS     bool
 	CreatedAt     time.Time
 	IPv4Address   string
